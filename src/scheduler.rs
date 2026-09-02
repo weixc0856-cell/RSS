@@ -9,8 +9,18 @@ use worker::*;
 /// (`queue::consume`), so one slow feed cannot stall the whole round and
 /// failures can be retried independently.
 #[event(scheduled)]
-pub async fn run(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+    // Unconditional first-line marker so we can tell "cron fired" apart from
+    // "cron fired but business logic produced no DB change".
+    let cron = event.cron();
+    console_log!("[scheduler] CRON FIRED cron={}", cron);
+
     let db = crate::db::get_db(&env)?;
+    // Heartbeat row: unambiguous proof that Cloudflare invoked this handler.
+    db.prepare("INSERT INTO cron_ticks (cron) VALUES (?1)")
+        .bind(&[cron.into()])?
+        .run()
+        .await?;
     let stmt = db.prepare(
         "SELECT id, url FROM feeds
          WHERE last_fetched_at IS NULL
