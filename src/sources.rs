@@ -73,6 +73,17 @@ async fn create_source_inner(
     let interval = clamp_int(payload.fetch_interval_minutes, 60);
 
     let db = db::get_db(env)?;
+
+    // Reject duplicates up-front (INSERT OR IGNORE alone would mask them).
+    let existing = db
+        .prepare("SELECT id FROM rss_sources WHERE user_id = ?1 AND url = ?2")
+        .bind(&[user_id.into(), url.clone().into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    if existing.is_some() {
+        return Response::error("source already exists for this user", 409);
+    }
+
     let args: Vec<D1Type<'_>> = vec![
         D1Type::Text(user_id),
         D1Type::Text(&url),
