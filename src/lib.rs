@@ -97,3 +97,21 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 }
 
+/// Queue consumer for `rss-fetch-queue` (see `[[queues.consumers]]` in
+/// `wrangler.toml.template`).
+///
+/// Currently acknowledges every message so the consumer binding stays active.
+/// TODO: once a producer payload contract is defined (e.g. `{ "url": ... }`),
+/// parse `message.body()` here and trigger feed fetching against D1.
+#[event(queue)]
+pub async fn queue_consumer(
+    mut batch: MessageBatch<serde_json::Value>,
+    _env: Env,
+    _ctx: Context,
+) -> Result<()> {
+    let messages = batch.messages()?;
+    let _message_count = messages.len();
+    batch.ack_all();
+    Ok(())
+}
+

@@ -24,6 +24,19 @@ id = "{{KV_NAMESPACE_ID}}"
 binding = "RSS_BUCKET"
 bucket_name = "{{R2_BUCKET_NAME}}"
 
+# 命名环境不继承顶层 binding，需在此完整声明开发 D1
+[[env.development.d1_databases]]
+binding = "rss_db"
+database_name = "rss-db-dev"
+database_id = "{{D1_DATABASE_ID}}"
+
+[[env.development.queues.producers]]
+queue = "{{RSS_FETCH_QUEUE}}"
+binding = "RSS_FETCH_QUEUE"
+
+# 队列 consumer 全账户同一时间只能挂在一个 Worker 上（见顶层 [[queues.consumers]]，
+# 由默认 rss-worker 承担），因此各命名环境不再声明 consumer。
+
 # Production environment
 [env.production]
 vars = { ENVIRONMENT = "production", LOG_LEVEL = "warn" }
@@ -39,6 +52,10 @@ database_id = "{{PROD_D1_DATABASE_ID}}"
 [[env.production.r2_buckets]]
 binding = "RSS_BUCKET"
 bucket_name = "{{PROD_R2_BUCKET_NAME}}"
+
+[[env.production.queues.producers]]
+queue = "{{RSS_FETCH_QUEUE}}"
+binding = "RSS_FETCH_QUEUE"
 
 # Queues (shared across environments)
 [[queues.producers]]
