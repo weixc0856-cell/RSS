@@ -70,15 +70,16 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
 
     let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
     if !(200..300).contains(&response.status_code()) {
-        update_feed_status(&db, feed.id, "error").await?;
-        return Err(Error::RustError(format!("feed returned HTTP {}", response.status_code())));
+        let message = format!("feed returned HTTP {}", response.status_code());
+        update_feed_status(&db, feed.id, "error", Some(message.clone())).await?;
+        return Err(Error::RustError(message));
     }
 
     let content = response.text().await?;
     let articles = match parse_document(&content, feed.id) {
         Ok(articles) => articles,
         Err(error) => {
-            update_feed_status(&db, feed.id, "error").await?;
+            update_feed_status(&db, feed.id, "error", Some(error.to_string())).await?;
             return Err(error);
         }
     };
@@ -104,15 +105,25 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         .await?;
     }
 
-    update_feed_status(&db, feed.id, "active").await
+    update_feed_status(&db, feed.id, "active", None).await
 }
 
-async fn update_feed_status(db: &worker::D1Database, feed_id: i32, status: &str) -> Result<()> {
+async fn update_feed_status(
+    db: &worker::D1Database,
+    feed_id: i32,
+    status: &str,
+    error_message: Option<String>,
+) -> Result<()> {
+    let args = [
+        D1Type::Text(status),
+        d1_text_or_null(&error_message),
+        D1Type::Integer(feed_id),
+    ];
     db.prepare(
-        "UPDATE feeds SET status = ?1, last_fetched_at = CURRENT_TIMESTAMP,
-         updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        "UPDATE feeds SET status = ?1, error_message = ?2, last_fetched_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
     )
-    .bind(&[status.into(), feed_id.into()])?
+    .bind_refs(args.iter())?
     .run()
     .await?;
     Ok(())

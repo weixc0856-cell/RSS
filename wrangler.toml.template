@@ -2,6 +2,10 @@ name = "rss-worker"
 compatibility_date = "2026-09-02"
 main = "build/worker/shim.mjs"
 
+# 每小时触发一次；cron 只负责把到期 feed 推入 RSS_FETCH_QUEUE，抓取在 queue consumer 内执行
+[triggers]
+crons = ["0 * * * *"]
+
 # 默认配置（开发环境）
 # 本文件由 scripts/render-config.ps1 从 wrangler.toml.template 渲染生成，
 # 已被 .gitignore 忽略（不会入库）；如需调整配置结构请改 wrangler.toml.template。
