@@ -16,6 +16,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
     let method = req.method();
 
+    // CORS preflight (browser UI on a different origin)
+    if method == Method::Options {
+        let mut response = Response::empty()?;
+        apply_cors(&mut response)?;
+        return Ok(response);
+    }
+
     // Root endpoint
     if method == Method::Get && path == "/" {
         return Response::ok(
@@ -43,7 +50,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     // API routes
-    match (method, path.as_str()) {
+    let outcome = match (method, path.as_str()) {
         // Read-only production diagnostics
         (Method::Get, "/api/diagnostics") => handle_diagnostics(env).await,
 
@@ -143,7 +150,28 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
 
         _ => Response::error("Not Found", 404),
-    }
+    };
+
+    let mut response = outcome?;
+    apply_cors(&mut response)?;
+    Ok(response)
+}
+
+/// Attach permissive CORS headers so the browser frontend (Cloudflare Pages)
+/// can call this Worker API cross-origin. Harden the origin list before
+/// exposing to untrusted consumers.
+fn apply_cors(response: &mut Response) -> Result<()> {
+    response.headers_mut().set("Access-Control-Allow-Origin", "*")?;
+    response
+        .headers_mut()
+        .set("Access-Control-Allow-Headers", "Content-Type, X-User-Id")?;
+    response
+        .headers_mut()
+        .set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")?;
+    response
+        .headers_mut()
+        .set("Access-Control-Max-Age", "86400")?;
+    Ok(())
 }
 
 
