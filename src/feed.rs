@@ -44,6 +44,12 @@ fn d1_text_or_null(value: &Option<String>) -> D1Type<'_> {
     }
 }
 
+/// Shared outbound HTTP helper (browser-like UA). Used by the legacy feed
+/// pipeline and the user-scoped `rss_sources` pipeline.
+pub(crate) async fn fetch_remote(url: &Url) -> Result<worker::Response> {
+    fetch_with_ua(url).await
+}
+
 /// Send an outbound GET for a feed with a browser-like `User-Agent`, which a
 /// number of publishers use to decide whether to serve RSS or block bots.
 async fn fetch_with_ua(url: &Url) -> Result<worker::Response> {

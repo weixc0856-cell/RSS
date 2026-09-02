@@ -1,5 +1,7 @@
 mod types;
 mod routes;
+mod auth;
+mod sources;
 mod db;
 mod feed;
 mod queue;
@@ -44,6 +46,36 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     match (method, path.as_str()) {
         // Read-only production diagnostics
         (Method::Get, "/api/diagnostics") => handle_diagnostics(env).await,
+
+        // User-scoped RSS source CRUD (/api/sources)
+        (Method::Get, "/api/sources") => {
+            let user_id = auth::current_user(&req);
+            sources::list_sources(&user_id, &env).await
+        }
+        (Method::Post, "/api/sources") => {
+            let user_id = auth::current_user(&req);
+            sources::create_source(req, &user_id, &env).await
+        }
+        (Method::Post, path)
+            if path.starts_with("/api/sources/") && path.ends_with("/fetch") =>
+        {
+            let user_id = auth::current_user(&req);
+            sources::trigger_source_fetch(req, &user_id, &env).await
+        }
+        (Method::Get, path)
+            if path.starts_with("/api/sources/") && path.ends_with("/articles") =>
+        {
+            let user_id = auth::current_user(&req);
+            sources::list_source_articles(req, &user_id, &env).await
+        }
+        (Method::Put, path) if path.starts_with("/api/sources/") => {
+            let user_id = auth::current_user(&req);
+            sources::update_source(req, &user_id, &env).await
+        }
+        (Method::Delete, path) if path.starts_with("/api/sources/") => {
+            let user_id = auth::current_user(&req);
+            sources::delete_source(req, &user_id, &env).await
+        }
 
         // Feed management
         (Method::Get, "/api/feeds") => handle_get_feeds(env).await,

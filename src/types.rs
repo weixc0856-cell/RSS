@@ -52,6 +52,55 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
+// --- User-scoped source model (rss_sources / rss_articles) ------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceItem {
+    pub id: Option<i64>,
+    pub user_id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub enabled: Option<i64>,
+    pub fetch_interval_minutes: Option<i64>,
+    pub last_fetched_at: Option<String>,
+    pub status: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSourceRequest {
+    pub url: String,
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub enabled: Option<i64>,
+    pub fetch_interval_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSourceRequest {
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub enabled: Option<i64>,
+    pub fetch_interval_minutes: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RssArticle {
+    pub id: Option<i64>,
+    pub source_id: Option<i64>,
+    pub title: String,
+    pub link: String,
+    pub guid: String,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub published_at: Option<String>,
+    pub hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

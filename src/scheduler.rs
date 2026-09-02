@@ -44,6 +44,38 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
         sent += 1;
     }
 
-    console_log!("[scheduler] queued {} feed(s) for refresh", sent);
+    // User-scoped sources: honour per-source enabled flag and interval.
+    let src_stmt = db.prepare(
+        "SELECT id, user_id, url FROM rss_sources
+         WHERE enabled = 1
+           AND (last_fetched_at IS NULL
+                OR (julianday('now') - julianday(last_fetched_at)) * 1440 >= fetch_interval_minutes)
+         ORDER BY id",
+    );
+    let src_rows = src_stmt.all().await?;
+    let sources = src_rows.results::<Value>()?;
+    let mut sent_sources = 0usize;
+    for row in sources {
+        let source_id = row["id"].as_i64().unwrap_or(0);
+        let user_id = row["user_id"].as_str().unwrap_or("");
+        let url = row["url"].as_str().unwrap_or("");
+        if source_id <= 0 || user_id.is_empty() || url.is_empty() {
+            continue;
+        }
+        queue
+            .send(serde_json::json!({
+                "source_id": source_id,
+                "user_id": user_id,
+                "url": url
+            }))
+            .await?;
+        sent_sources += 1;
+    }
+
+    console_log!(
+        "[scheduler] queued {} legacy feed(s) and {} user source(s)",
+        sent,
+        sent_sources
+    );
     Ok(())
 }
