@@ -1,0 +1,27 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Sidebar from "../components/Sidebar.astro";
+import TopBar from "../components/TopBar.astro";
+---
+
+<BaseLayout title="RSS Intelligence — Signals">
+  <div class="app">
+    <Sidebar />
+    <main class="main">
+      <div class="content">
+        <TopBar />
+
+        <section id="stats" class="stats" aria-live="polite"></section>
+
+        <section id="items" class="items" aria-live="polite"></section>
+        <p id="empty" class="empty">No signals match your search.</p>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    import "../scripts/app";
+  </script>
+</BaseLayout>

@@ -1,0 +1,30 @@
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-mark">R</div>
+    <div>
+      <div class="brand-name">RSS Intelligence</div>
+      <div class="brand-sub">Cloudflare Worker feeds</div>
+    </div>
+  </div>
+
+  <div class="nav-label">Feeds</div>
+  <nav class="nav" id="feedNav" aria-label="Feeds"></nav>
+
+  <div class="sidebar-bottom">
+    <form class="feed-form" id="feedForm">
+      <input
+        id="feedUrl"
+        type="url"
+        placeholder="https://example.com/feed.xml"
+        required
+      />
+      <input id="feedTitle" type="text" placeholder="Title (optional)" />
+      <button class="action-btn primary" type="submit">Add feed</button>
+    </form>
+
+    <div class="sync">
+      <span class="dot" id="healthDot"></span>
+      <span id="healthText">Loading…</span>
+    </div>
+  </div>
+</aside>

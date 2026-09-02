@@ -1,0 +1,20 @@
+<header class="topbar">
+  <div>
+    <h1>Signals</h1>
+    <div class="sub" id="subtitle">Loading feeds…</div>
+  </div>
+
+  <input id="search" class="search" type="search" placeholder="Search signals…" />
+
+  <select id="sort" class="sort" aria-label="Sort">
+    <option value="newest">Newest</option>
+    <option value="oldest">Oldest</option>
+  </select>
+
+  <div class="env-switch" role="group" aria-label="API environment">
+    <button type="button" id="envDev" data-env="dev">Dev</button>
+    <button type="button" id="envProd" data-env="prod">Prod</button>
+  </div>
+
+  <button type="button" id="refresh" class="action-btn primary">↻ Refresh</button>
+</header>
