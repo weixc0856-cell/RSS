@@ -145,6 +145,54 @@ pub async fn handle_fetch_feed(feed_id: i32, env: Env) -> Result<Response> {
     })
 }
 
+/// Read-only production diagnostics: feed status distribution, article count,
+/// failed feeds (with error_message) and cron heartbeat summary.
+pub async fn handle_diagnostics(env: Env) -> Result<Response> {
+    let db = db::get_db(&env)?;
+
+    let by_status = db
+        .prepare("SELECT status, COUNT(*) AS c FROM feeds GROUP BY status ORDER BY status")
+        .all()
+        .await?
+        .results::<Value>()?;
+
+    let articles_total = db
+        .prepare("SELECT COUNT(*) AS total FROM articles")
+        .all()
+        .await?
+        .results::<Value>()?;
+
+    let failed = db
+        .prepare(
+            "SELECT id, title, url, error_message, last_fetched_at
+             FROM feeds WHERE status = 'error'
+             ORDER BY id LIMIT 20",
+        )
+        .all()
+        .await?
+        .results::<Value>()?;
+
+    let cron = db
+        .prepare("SELECT COUNT(*) AS ticks, MAX(fired_at) AS last_tick FROM cron_ticks")
+        .all()
+        .await?
+        .results::<Value>()?;
+
+    let data = serde_json::json!({
+        "feeds_by_status": by_status,
+        "articles_total": articles_total,
+        "failed_feeds": failed,
+        "cron_ticks": cron,
+        "generated_at": crate::utils::current_timestamp(),
+    });
+
+    Response::from_json(&ApiResponse {
+        success: true,
+        data: Some(data),
+        error: None,
+    })
+}
+
 pub async fn handle_get_user_feeds(user_id: i32) -> Result<Response> {
     Response::from_json(&ApiResponse::<Vec<Feed>> {
         success: true,

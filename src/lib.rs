@@ -43,6 +43,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     // API routes
     match (method, path.as_str()) {
+        // Read-only production diagnostics
+        (Method::Get, "/api/diagnostics") => handle_diagnostics(env).await,
+
         // Feed management
         (Method::Get, "/api/feeds") => handle_get_feeds(env).await,
         (Method::Post, "/api/feeds") => handle_create_feed(req, env).await,

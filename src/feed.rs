@@ -3,7 +3,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use url::Url;
 use worker::d1::D1Type;
-use worker::{Error, Env, Fetch, Headers, Method, Request, RequestInit, Result};
+use worker::{console_error, console_log, Error, Env, Fetch, Headers, Method, Request, RequestInit, Result};
 
 /// Cap per-fetch inserts so a single Worker invocation stays within
 /// per-request limits (e.g. subrequests / D1 API calls on the free plan).
@@ -68,9 +68,11 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         .await?
         .ok_or_else(|| Error::RustError("feed not found".to_string()))?;
 
+    console_log!("[feed] fetch start feed_id={} url={}", feed.id, url);
     let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
     if !(200..300).contains(&response.status_code()) {
         let message = format!("feed returned HTTP {}", response.status_code());
+        console_error!("[feed] http error feed_id={} {}", feed.id, message);
         update_feed_status(&db, feed.id, "error", Some(message.clone())).await?;
         return Err(Error::RustError(message));
     }
@@ -79,11 +81,13 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
     let articles = match parse_document(&content, feed.id) {
         Ok(articles) => articles,
         Err(error) => {
+            console_error!("[feed] parse error feed_id={}: {}", feed.id, error);
             update_feed_status(&db, feed.id, "error", Some(error.to_string())).await?;
             return Err(error);
         }
     };
 
+    let mut stored = 0usize;
     for article in articles.into_iter().take(MAX_ARTICLES_PER_FETCH) {
         let args = [
             D1Type::Integer(article.feed_id),
@@ -103,8 +107,15 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         .bind_refs(args.iter())?
         .run()
         .await?;
+        stored += 1;
     }
 
+    console_log!(
+        "[feed] fetch ok feed_id={} parsed_articles={} stored_attempts={}",
+        feed.id,
+        MAX_ARTICLES_PER_FETCH,
+        stored
+    );
     update_feed_status(&db, feed.id, "active", None).await
 }
 
