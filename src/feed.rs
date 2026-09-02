@@ -2,13 +2,18 @@ use crate::types::{Article, Feed};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use url::Url;
-use worker::{Error, Env, Fetch, Result};
+use worker::d1::D1Type;
+use worker::{Error, Env, Fetch, Headers, Method, Request, RequestInit, Result};
+
+/// Cap per-fetch inserts so a single Worker invocation stays within
+/// per-request limits (e.g. subrequests / D1 API calls on the free plan).
+const MAX_ARTICLES_PER_FETCH: usize = 25;
 
 pub struct FeedParser;
 
 impl FeedParser {
     pub async fn fetch_feed(url: &str) -> Result<Vec<Article>> {
-        let mut response = Fetch::Url(Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).send().await?;
+        let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
         if !(200..300).contains(&response.status_code()) {
             return Err(Error::RustError(format!("feed returned HTTP {}", response.status_code())));
         }
@@ -30,6 +35,30 @@ impl FeedParser {
     }
 }
 
+/// D1 bindings do not accept `undefined`; nullable text columns must be bound
+/// as an explicit SQL `NULL` (`D1Type::Null`) or a string.
+fn d1_text_or_null(value: &Option<String>) -> D1Type<'_> {
+    match value {
+        Some(text) => D1Type::Text(text),
+        None => D1Type::Null,
+    }
+}
+
+/// Send an outbound GET for a feed with a browser-like `User-Agent`, which a
+/// number of publishers use to decide whether to serve RSS or block bots.
+async fn fetch_with_ua(url: &Url) -> Result<worker::Response> {
+    let mut headers = Headers::new();
+    headers.set(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    )?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get).with_headers(headers);
+    let request = Request::new_with_init(url.as_str(), &init)?;
+    Fetch::Request(request).send().await
+}
+
 pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
     let db = env.d1("rss_db")?;
     let feed = db
@@ -39,7 +68,7 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         .await?
         .ok_or_else(|| Error::RustError("feed not found".to_string()))?;
 
-    let mut response = Fetch::Url(Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).send().await?;
+    let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
     if !(200..300).contains(&response.status_code()) {
         update_feed_status(&db, feed.id, "error").await?;
         return Err(Error::RustError(format!("feed returned HTTP {}", response.status_code())));
@@ -54,22 +83,23 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         }
     };
 
-    for article in articles {
+    for article in articles.into_iter().take(MAX_ARTICLES_PER_FETCH) {
+        let args = [
+            D1Type::Integer(article.feed_id),
+            D1Type::Text(&article.title),
+            D1Type::Text(&article.link),
+            D1Type::Text(&article.guid),
+            d1_text_or_null(&article.summary),
+            d1_text_or_null(&article.content),
+            d1_text_or_null(&article.published_at),
+            D1Type::Text(&article.hash),
+        ];
         db.prepare(
             "INSERT OR IGNORE INTO articles
              (feed_id, title, link, guid, summary, content, published_at, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
-        .bind(&[
-            article.feed_id.into(),
-            article.title.into(),
-            article.link.into(),
-            article.guid.into(),
-            article.summary.into(),
-            article.content.into(),
-            article.published_at.into(),
-            article.hash.into(),
-        ])?
+        .bind_refs(args.iter())?
         .run()
         .await?;
     }

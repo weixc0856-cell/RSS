@@ -52,6 +52,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         }
 
+        // Fetch/refresh a single feed (fetch → parse → persist to D1)
+        (Method::Post, path) if path.starts_with("/api/feeds/") && path.ends_with("/fetch") => {
+            let feed_id_str = path
+                .strip_prefix("/api/feeds/")
+                .and_then(|s| s.strip_suffix("/fetch"))
+                .unwrap_or("");
+            if let Ok(feed_id) = feed_id_str.parse::<i32>() {
+                handle_fetch_feed(feed_id, env).await
+            } else {
+                Response::error("Invalid feed ID", 400)
+            }
+        }
+
         // Articles
         (Method::Get, path) if path.starts_with("/api/feeds/") && path.ends_with("/articles") => {
             let feed_id_str = path
@@ -59,7 +72,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .and_then(|s| s.strip_suffix("/articles"))
                 .unwrap_or("");
             if let Ok(feed_id) = feed_id_str.parse::<i32>() {
-                handle_get_articles(feed_id).await
+                handle_get_articles(feed_id, env).await
             } else {
                 Response::error("Invalid feed ID", 400)
             }
