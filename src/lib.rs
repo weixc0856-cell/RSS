@@ -4,7 +4,6 @@ mod db;
 mod feed;
 mod queue;
 mod scheduler;
-mod kv;
 mod utils;
 
 use worker::*;

@@ -50,3 +50,38 @@ pub async fn consume(
     batch.ack_all();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_job_serializes_and_deserializes() {
+        let job = FetchJob {
+            feed_id: 42,
+            url: "https://example.com/rss.xml".to_string(),
+        };
+        let json = serde_json::to_string(&job).expect("serialize");
+        let back: FetchJob = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(job.feed_id, back.feed_id);
+        assert_eq!(job.url, back.url);
+    }
+
+    #[test]
+    fn fetch_job_parses_from_scheduler_payload() {
+        // Mirrors the exact payload produced by scheduler.rs.
+        let payload = serde_json::json!({ "feed_id": 7, "url": "https://example.com/rss" });
+        let job: FetchJob = serde_json::from_value(payload).expect("parse");
+        assert_eq!(job.feed_id, 7);
+        assert_eq!(job.url, "https://example.com/rss");
+    }
+
+    #[test]
+    fn fetch_job_rejects_malformed_payloads() {
+        // Missing url / wrong types must not silently produce a bogus job.
+        assert!(serde_json::from_str::<FetchJob>(r#"{"feed_id":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<FetchJob>(r#"{"feed_id":"x","url":"https://a.b"}"#).is_err()
+        );
+    }
+}

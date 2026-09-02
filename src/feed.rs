@@ -547,5 +547,14 @@ mod tests {
         assert_eq!(attribute(&start, b"href"), "https://example.com/lower");
     }
 
+    #[test]
+    fn d1_text_or_null_encodes_none_as_null_and_some_as_text() {
+        assert!(matches!(d1_text_or_null(&None), D1Type::Null));
+        assert!(matches!(
+            d1_text_or_null(&Some("hello".to_string())),
+            D1Type::Text("hello")
+        ));
+    }
+
 }
 

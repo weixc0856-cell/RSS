@@ -57,11 +57,20 @@ database_id = "{{PROD_D1_DATABASE_ID}}"
 binding = "RSS_BUCKET"
 bucket_name = "{{PROD_R2_BUCKET_NAME}}"
 
+# Production uses its own queue so its scheduled refresh writes to prod D1
+# (a queue can only have one consumer per account).
 [[env.production.queues.producers]]
-queue = "{{RSS_FETCH_QUEUE}}"
+queue = "{{RSS_FETCH_QUEUE_PROD}}"
 binding = "RSS_FETCH_QUEUE"
 
-# Queues (shared across environments)
+[[env.production.queues.consumers]]
+queue = "{{RSS_FETCH_QUEUE_PROD}}"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "{{RSS_FETCH_DLQ}}"
+
+# Queues (default/development worker - shared queue consumed by rss-worker)
 [[queues.producers]]
 queue = "{{RSS_FETCH_QUEUE}}"
 binding = "RSS_FETCH_QUEUE"

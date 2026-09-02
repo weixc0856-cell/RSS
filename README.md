@@ -23,12 +23,13 @@ D:\Project\RSS\
 ├─ migrations/
 │  └─ 001_init.sql         # Database initialization
 ├─ src/
-│  ├─ lib.rs               # Main worker entry point
+│  ├─ lib.rs               # Main worker entry point (fetch router)
 │  ├─ types.rs             # Data models and types
-│  ├─ routes.rs            # API route handlers
-│  ├─ db.rs                # Database operations
-│  ├─ feed.rs              # RSS/Atom feed parsing
-│  └─ kv.rs                # Cloudflare KV cache wrapper
+│  ├─ routes.rs            # API route handlers (incl. GET /api/diagnostics)
+│  ├─ db.rs                # D1 access
+│  ├─ feed.rs              # RSS/Atom feed parsing & fetch/persist pipeline
+│  ├─ queue.rs             # Queue consumer (fetch jobs produced by scheduler)
+│  └─ scheduler.rs         # Cron trigger: enqueues due feeds (hourly)
 ├─ public/
 │  └─ index.html           # Landing page with API docs
 └─ build/
