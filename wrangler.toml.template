@@ -1,0 +1,53 @@
+name = "rss-worker"
+compatibility_date = "2026-09-02"
+main = "build/worker/shim.mjs"
+
+# 默认配置（开发环境）
+# 本文件由 scripts/render-config.ps1 从 wrangler.toml.template 渲染生成，
+# 已被 .gitignore 忽略（不会入库）；如需调整配置结构请改 wrangler.toml.template。
+[[d1_databases]]
+binding = "rss_db"
+database_name = "rss-db-dev"
+database_id = "{{D1_DATABASE_ID}}"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# Environment variables - Load from .env files
+[env.development]
+vars = { ENVIRONMENT = "development", LOG_LEVEL = "debug" }
+[[env.development.kv_namespaces]]
+binding = "CACHE"
+id = "{{KV_NAMESPACE_ID}}"
+
+[[env.development.r2_buckets]]
+binding = "RSS_BUCKET"
+bucket_name = "{{R2_BUCKET_NAME}}"
+
+# Production environment
+[env.production]
+vars = { ENVIRONMENT = "production", LOG_LEVEL = "warn" }
+[[env.production.kv_namespaces]]
+binding = "CACHE"
+id = "{{PROD_KV_NAMESPACE_ID}}"
+
+[[env.production.d1_databases]]
+binding = "rss_db"
+database_name = "rss-db"
+database_id = "{{PROD_D1_DATABASE_ID}}"
+
+[[env.production.r2_buckets]]
+binding = "RSS_BUCKET"
+bucket_name = "{{PROD_R2_BUCKET_NAME}}"
+
+# Queues (shared across environments)
+[[queues.producers]]
+queue = "{{RSS_FETCH_QUEUE}}"
+binding = "RSS_FETCH_QUEUE"
+
+[[queues.consumers]]
+queue = "{{RSS_FETCH_QUEUE}}"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "{{RSS_FETCH_DLQ}}"

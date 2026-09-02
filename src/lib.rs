@@ -1,0 +1,99 @@
+mod types;
+mod routes;
+mod db;
+mod feed;
+mod kv;
+mod utils;
+
+use worker::*;
+use routes::*;
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let path = req.path();
+    let method = req.method();
+
+    // Root endpoint
+    if method == Method::Get && path == "/" {
+        return Response::ok(
+            "Welcome to RSS Aggregator API! Available endpoints: /feed, /feed/:id, /articles",
+        );
+    }
+
+    // Health check endpoint
+    if path == "/health" {
+        return health().await;
+    }
+
+    // Backward-compatible feed endpoints
+    if method == Method::Get && path == "/feed" {
+        return list_feeds(env).await;
+    }
+
+    if method == Method::Get && path.starts_with("/feed/") {
+        let feed_id = path.strip_prefix("/feed/").unwrap_or("");
+        if feed_id.is_empty() || feed_id.contains('/') {
+            return Response::error("Missing feed ID", 400);
+        }
+
+        return Response::ok(format!("Requested feed with ID: {}", feed_id));
+    }
+
+    // API routes
+    match (method, path.as_str()) {
+        // Feed management
+        (Method::Get, "/api/feeds") => handle_get_feeds(env).await,
+        (Method::Post, "/api/feeds") => handle_create_feed(req, env).await,
+        (Method::Delete, path) if path.starts_with("/api/feeds/") && !path.ends_with("/articles") && !path.ends_with("/subscribe") => {
+            if let Ok(feed_id) = path.strip_prefix("/api/feeds/").unwrap_or("").parse::<i32>() {
+                handle_delete_feed(feed_id).await
+            } else {
+                Response::error("Invalid feed ID", 400)
+            }
+        }
+
+        // Articles
+        (Method::Get, path) if path.starts_with("/api/feeds/") && path.ends_with("/articles") => {
+            let feed_id_str = path
+                .strip_prefix("/api/feeds/")
+                .and_then(|s| s.strip_suffix("/articles"))
+                .unwrap_or("");
+            if let Ok(feed_id) = feed_id_str.parse::<i32>() {
+                handle_get_articles(feed_id).await
+            } else {
+                Response::error("Invalid feed ID", 400)
+            }
+        }
+
+        // User subscriptions
+        (Method::Get, path) if path.starts_with("/api/users/") && path.ends_with("/feeds") => {
+            let user_id_str = path
+                .strip_prefix("/api/users/")
+                .and_then(|s| s.strip_suffix("/feeds"))
+                .unwrap_or("");
+            if let Ok(user_id) = user_id_str.parse::<i32>() {
+                handle_get_user_feeds(user_id).await
+            } else {
+                Response::error("Invalid user ID", 400)
+            }
+        }
+
+        (Method::Post, "/api/subscriptions") => handle_subscribe_feed(req).await,
+        
+        (Method::Delete, path) if path.starts_with("/api/users/") && path.contains("/subscriptions/") => {
+            let parts: Vec<&str> = path.split("/").collect();
+            if parts.len() >= 5 {
+                if let (Ok(user_id), Ok(feed_id)) = (parts[3].parse::<i32>(), parts[5].parse::<i32>()) {
+                    handle_unsubscribe_feed(user_id, feed_id).await
+                } else {
+                    Response::error("Invalid IDs", 400)
+                }
+            } else {
+                Response::error("Invalid path", 400)
+            }
+        }
+
+        _ => Response::error("Not Found", 404),
+    }
+}
+
