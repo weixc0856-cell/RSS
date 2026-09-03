@@ -31,8 +31,11 @@
 
 ```
 rss-worker (rss-worker.weixc0856.workers.dev)  →  D1 rss-db-dev   （默认/开发）
-rss-worker-development                         →  D1 rss-db-dev   （--env development）
 ```
+
+> 2026-09-03：删除 `rss-worker-development`（`--env development` 产物，曾与 `rss-worker`
+> 重复绑定同一 dev D1/queue，无 cron、非 queue consumer，从不运行）。dev 实例仅保留
+> 默认环境的 `rss-worker`。
 
 规则：
 - **`rss-db`（生产 D1）是 RSS Intelligence 唯一数据事实来源。**
@@ -44,8 +47,9 @@ rss-worker-development                         →  D1 rss-db-dev   （--env dev
 | 名称 | workers.dev | D1 | Queue | Cron | 角色 |
 |---|---|---|---|---|---|
 | `rss-worker` | rss-worker.weixc0856.workers.dev | rss-db-dev | rss-fetch-queue (producer+consumer) | `*/15 * * * *` | 开发默认环境（保留，仅供本地/测试） |
-| `rss-worker-development` | rss-worker-development.weixc0856.workers.dev | rss-db-dev | rss-fetch-queue (producer) | 无 | `--env development` 产物 |
 | `rss-worker-production` | rss-worker-production.weixc0856.workers.dev | **rss-db** | rss-fetch-queue-prod (producer+consumer) | `*/15 * * * *` | **生产数据平面（唯一）** |
+
+> `rss-worker-development` 已于 2026-09-03 删除（原为 `--env development` 产物，见 §1）。
 
 ## 3. 数据身份
 
