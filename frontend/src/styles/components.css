@@ -165,6 +165,21 @@
   display: block;
 }
 
+/* Article-area error state (rendered into #items): distinct from the empty
+   message — a failed load is retryable, an empty list is not an error. */
+.items-state {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  padding: 60px 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.items-state.error .nav-state-title {
+  color: var(--accent);
+}
+
 .skeleton {
   border-radius: var(--radius);
   background: linear-gradient(90deg, #ecece6 25%, #f5f5f0 50%, #ecece6 75%);

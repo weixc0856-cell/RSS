@@ -37,11 +37,19 @@ const els = {
   toast: $<HTMLElement>("toast"),
 };
 
+type LoadState = "loading" | "loaded" | "error";
+
 let feeds: Feed[] = [];
 let articles: Article[] = [];
 let activeFeedId: number | null = null;
 let diagnostics: Diagnostics | null = null;
 let toastTimer = 0;
+
+// Per-area load state. "loading" and "error" must never render as an empty
+// feed/article list — only a successful load with zero rows means "no data".
+let feedsState: LoadState = "loading";
+let articlesState: LoadState = "loading";
+let diagOk = false;
 
 function escapeHtml(text: string): string {
   return text
@@ -97,6 +105,20 @@ function feedHealth(f: Feed): HealthLine {
 }
 
 function renderNav(): void {
+  if (feedsState === "loading") {
+    els.feedNav.innerHTML =
+      `<div class="nav-state"><span class="spinner"></span>Loading feeds…</div>`;
+    return;
+  }
+  if (feedsState === "error") {
+    els.feedNav.innerHTML =
+      `<div class="nav-state error">
+        <div class="nav-state-title">Unable to load feeds</div>
+        <div class="nav-state-sub">Production API unavailable.</div>
+        <button class="action-btn" type="button" data-action="retry-feeds">Retry</button>
+      </div>`;
+    return;
+  }
   const html = feeds
     .map((f) => {
       const title = escapeHtml(f.title || domainOf(f.url));
@@ -118,35 +140,52 @@ function renderNav(): void {
       </button>`;
     })
     .join("");
-  els.feedNav.innerHTML = html || `<div class="nav-label">No feeds yet</div>`;
+  els.feedNav.innerHTML =
+    html ||
+    `<div class="nav-state">No feeds yet<div class="nav-state-sub">Add a feed below to get started.</div></div>`;
 }
 
 function renderStats(): void {
-  if (!diagnostics) return;
-  const byStatus = Object.fromEntries(
-    diagnostics.feeds_by_status.map((s) => [s.status, s.c])
-  );
-  const total = diagnostics.articles_total[0]?.total ?? 0;
-  const active = byStatus["active"] ?? 0;
-  const errors = byStatus["error"] ?? 0;
-  const run = diagnostics.last_fetch_run;
-  const lastSync = run?.started_at ?? diagnostics.cron_ticks[0]?.last_tick ?? null;
-  const runFailed = run?.feeds_failed ?? 0;
-
-  els.healthDot.classList.toggle("error", errors > 0);
-  els.healthText.textContent = `${active} active · ${errors} failed · sync ${timeAgo(
-    lastSync
-  )}${runFailed ? ` · ${runFailed} failed this run` : ""}`;
-  els.subtitle.textContent = `${active} live feeds · ${total} articles stored`;
-
   const stat = (value: string | number, label: string): string =>
     `<div class="stat"><div class="value">${value}</div><div class="label">${label}</div></div>`;
 
-  els.stats.innerHTML =
-    stat(active, "Active feeds") +
-    stat(errors, "Failed feeds") +
-    stat(total, "Articles") +
-    stat(timeAgo(lastSync), "Last sync");
+  // Diagnostics is auxiliary: when it fails, feeds still render with a quiet
+  // "System status unavailable" line — never a page-level error.
+  if (diagOk && diagnostics) {
+    const byStatus = Object.fromEntries(
+      diagnostics.feeds_by_status.map((s) => [s.status, s.c])
+    );
+    const total = diagnostics.articles_total[0]?.total ?? 0;
+    const active = byStatus["active"] ?? 0;
+    const errors = byStatus["error"] ?? 0;
+    const run = diagnostics.last_fetch_run;
+    const lastSync = run?.started_at ?? diagnostics.cron_ticks[0]?.last_tick ?? null;
+    const runFailed = run?.feeds_failed ?? 0;
+
+    els.healthDot.classList.toggle("error", errors > 0);
+    els.healthText.textContent = `${active} active · ${errors} failed · sync ${timeAgo(
+      lastSync
+    )}${runFailed ? ` · ${runFailed} failed this run` : ""}`;
+    els.subtitle.textContent = `${active} live feeds · ${total} articles stored`;
+
+    els.stats.innerHTML =
+      stat(active, "Active feeds") +
+      stat(errors, "Failed feeds") +
+      stat(total, "Articles") +
+      stat(timeAgo(lastSync), "Last sync");
+  } else {
+    const active = feeds.filter((f) => f.status === "active").length;
+    const errors = feeds.filter((f) => f.status === "error").length;
+    els.healthDot.classList.toggle("error", errors > 0);
+    els.healthText.textContent = "System status unavailable";
+    els.subtitle.textContent = `${active} live feeds`;
+
+    els.stats.innerHTML =
+      stat(active, "Active feeds") +
+      stat(errors, "Failed feeds") +
+      stat("—", "Articles") +
+      stat("—", "Last sync");
+  }
 }
 
 function visibleArticles(): Article[] {
@@ -169,9 +208,30 @@ function visibleArticles(): Article[] {
 }
 
 function renderItems(): void {
+  if (articlesState === "error") {
+    els.empty.classList.remove("visible");
+    els.items.innerHTML =
+      `<div class="items-state error">
+        <div class="nav-state-title">Unable to load articles</div>
+        <button class="action-btn" type="button" data-action="retry-articles">Retry</button>
+      </div>`;
+    return;
+  }
+
+  const q = els.search.value.trim();
   const list = visibleArticles();
-  els.empty.classList.toggle("visible", list.length === 0);
-  els.empty.textContent = "No signals match your search.";
+  if (list.length === 0) {
+    els.items.innerHTML = "";
+    els.empty.classList.add("visible");
+    els.empty.textContent =
+      activeFeedId === null
+        ? "No feeds yet — add one below."
+        : q
+          ? "No signals match your search."
+          : "No articles yet — this feed may not have been fetched yet.";
+    return;
+  }
+  els.empty.classList.remove("visible");
 
   els.items.innerHTML = list
     .map((a) => {
@@ -198,36 +258,65 @@ function renderItems(): void {
 async function loadArticles(): Promise<void> {
   if (activeFeedId === null) {
     articles = [];
+    articlesState = "loaded";
     renderItems();
     return;
   }
+  articlesState = "loading";
   els.items.innerHTML = `<div class="skeleton"></div>`;
-  articles = await getArticles(activeFeedId);
+  els.empty.classList.remove("visible");
+  try {
+    articles = await getArticles(activeFeedId);
+    articlesState = "loaded";
+  } catch {
+    articles = [];
+    articlesState = "error";
+  }
   renderItems();
 }
 
-async function loadAll(): Promise<void> {
+/** Load the global feed catalog. Failure renders an in-nav error + Retry —
+ *  never a blank "no feeds": empty is only shown on a successful empty list. */
+async function loadFeeds(): Promise<void> {
+  feedsState = "loading";
+  renderNav();
   try {
-    els.subtitle.textContent = "Loading…";
-    els.refresh.disabled = true;
-
-    const [feedList, diag] = await Promise.all([getFeeds(), getDiagnostics()]);
-    feeds = feedList;
-    diagnostics = diag;
-
-    const keep =
-      activeFeedId && feeds.some((f) => f.id === activeFeedId)
-        ? activeFeedId
-        : feeds[0]?.id ?? null;
-    activeFeedId = keep;
-
+    feeds = await getFeeds();
+  } catch {
+    feeds = [];
+    activeFeedId = null;
+    feedsState = "error";
     renderNav();
-    renderStats();
-    await loadArticles();
-  } catch (err) {
-    const message = err instanceof ApiError ? err.message : String(err);
-    toast(message, true);
-    els.subtitle.textContent = message;
+    return;
+  }
+  feedsState = "loaded";
+  const keep =
+    activeFeedId && feeds.some((f) => f.id === activeFeedId)
+      ? activeFeedId
+      : feeds[0]?.id ?? null;
+  activeFeedId = keep;
+  renderNav();
+  await loadArticles();
+}
+
+/** Load diagnostics; auxiliary only — on failure the feeds still render. */
+async function loadDiagnostics(): Promise<void> {
+  try {
+    diagnostics = await getDiagnostics();
+    diagOk = true;
+  } catch {
+    diagnostics = null;
+    diagOk = false;
+  }
+  renderStats();
+}
+
+async function loadAll(): Promise<void> {
+  els.subtitle.textContent = "Loading…";
+  els.refresh.disabled = true;
+  try {
+    // Independent: one failing endpoint must not blank the others.
+    await Promise.all([loadFeeds(), loadDiagnostics()]);
   } finally {
     els.refresh.disabled = false;
   }
@@ -241,8 +330,18 @@ function selectFeed(id: number): void {
 
 // --- Events -----------------------------------------------------------------
 els.feedNav.addEventListener("click", (event) => {
+  const action = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
+  if (action?.dataset.action === "retry-feeds") {
+    void loadFeeds();
+    return;
+  }
   const btn = (event.target as HTMLElement).closest<HTMLElement>("[data-feed]");
   if (btn) selectFeed(Number(btn.dataset.feed));
+});
+
+els.items.addEventListener("click", (event) => {
+  const action = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
+  if (action?.dataset.action === "retry-articles") void loadArticles();
 });
 
 els.search.addEventListener("input", renderItems);

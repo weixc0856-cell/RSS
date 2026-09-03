@@ -17,8 +17,14 @@ export const API_BASE: string =
   import.meta.env.ASTRO_PUBLIC_API_BASE ??
   "https://rss-worker-production.weixc0856.workers.dev";
 
+export type ApiErrorCode = "network" | "http";
+
 export class ApiError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(
+    message: string,
+    readonly status?: number,
+    readonly code?: ApiErrorCode
+  ) {
     super(message);
     this.name = "ApiError";
   }
@@ -34,19 +40,23 @@ async function request<T>(
       headers: { "Content-Type": "application/json" },
       ...init,
     });
-  } catch (cause) {
-    throw new ApiError(`Network error reaching ${API_BASE}${path}`);
+  } catch {
+    throw new ApiError(`Network error reaching ${API_BASE}${path}`, undefined, "network");
   }
 
   let json: ApiResponse<T>;
   try {
     json = (await res.json()) as ApiResponse<T>;
   } catch {
-    throw new ApiError(`Invalid JSON from ${res.status}`, res.status);
+    throw new ApiError(`Invalid JSON from ${res.status}`, res.status, "http");
   }
 
   if (!json.success || json.error) {
-    throw new ApiError(json.error ?? `Request failed (${res.status})`, res.status);
+    throw new ApiError(
+      json.error ?? `Request failed (${res.status})`,
+      res.status,
+      "http"
+    );
   }
   return json.data as T;
 }
