@@ -72,6 +72,29 @@ curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
 curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
 ```
 
+## 源清理（2026-09-03，run #8 之后）
+
+运营决定：移除三条持续 HTTP 503 的 Google News RSS 搜索源。它们在本轮上线前的
+03:01 曾短暂成功过一次（各入库一批文章），此后即被 Google 限流为 503；run #8 的
+`failed=3` 正是这三条。
+
+| id（已删） | title | URL（已删） |
+|---|---|---|
+| 4 | Anthropic Claude News | `https://news.google.com/rss/search?q=Anthropic+Claude&hl=en-US&gl=US&ceid=US:en` |
+| 5 | Grok xAI News | `https://news.google.com/rss/search?q=Grok+xAI&hl=en-US&gl=US&ceid=US:en` |
+| 6 | People's Daily English | `https://news.google.com/rss/search?q=site:en.people.cn&hl=en-US&gl=US&ceid=US:en` |
+
+- 删除方式：D1 生产库直删 —— HTTP `DELETE /api/feeds/:id` 当前是 stub
+  （见 [src/routes.rs:352](src/routes.rs#L352)），未走 API。先显式删子表再删 feeds，
+  不依赖 D1 的 FK pragma。
+- 连带删除：`articles` 共 82 篇（feed 4→28 / 5→29 / 6→25，均为 03:01 唯一一次成功
+  抓取入库）；`subscriptions` 0、`rss_sources` 无同 URL 行，无其他引用。
+- 删后（04:32 UTC 复核）：`feeds` total 6→**3**（active 3 / failed **0**）；
+  `articles.total` 1204→**1122**。
+- 删后首个 cron 周期 run #9：`ok`（scheduled=2/fetched=2/failed=0，04:30:38→04:31:14
+  正常终结）。剩余 3 源健康；这也是修复版 v2 下的**首个全 `ok` run**
+  （run #6 属旧代码，不作数）。
+
 ## 基线用途
 
 - 改动落地并部署后，对比同一端点：feeds.active / feeds.failed、last_run 的
