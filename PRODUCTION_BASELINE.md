@@ -36,6 +36,32 @@ curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
 {"success":true,"data":{"articles":{"newest_published_at":"Wed, 31 May 2023 07:00:00 GMT","newest_stored_at":"2026-09-03 03:01:20","total":1203},"environment":"production","feeds":{"active":3,"failed":3,"total":6},"generated_at":"2026-09-03T03:43:34.677+00:00","scheduler":{"last_run":{"articles_inserted":0,"feeds_failed":3,"feeds_fetched":2,"feeds_scheduled":5,"finished_at":"2026-09-03 03:31:35","id":5,"started_at":"2026-09-03 03:30:38","status":"partial"},"oldest_successful_feed_at":"2026-09-03 03:16:10"}},"error":null}
 ```
 
+## 部署后复测（2026-09-03，修复版已上线）
+
+- 部署对象：`rss-worker-production` Version `49a72322-8f3e-42ed-a049-c752b8600254`
+  （commit `775a5bd`，`feat(frontend)` 至 `chore(data)` 5 个 commit 推送 + 部署）；
+  Pages production 同步到 commit `775a5bd`。
+- 部署后快照（`generated_at` 2026-09-03T03:55:58 UTC）：
+
+| 维度 | 值 |
+|---|---|
+| feeds.active / failed / total | 3 / 3 / 6 |
+| articles.total | 1203 |
+| scheduler.last_run.id | 6 |
+| scheduler.last_run.status | `ok`（feeds_scheduled=1，feeds_fetched=1，feeds_failed=0） |
+| scheduler.last_run.started_at / finished_at | 2026-09-03 03:45:38 / 03:46:11 |
+
+- 说明：run #6 是部署后第一个完整周期，`scheduled 1 = fetched 1`、`status ok`、
+  `finished_at` 置位 —— 累计记账 + 终态判定在真实链路上工作正常。
+  该 run 无失败，`partial`/`failed` 分支由单元测试（`classify_run` 边界：
+  `(2,2,1)→partial`、`(2,3,0)→ok` 等，48 用例全绿）覆盖；后续自然 cron 周期
+  出现失败 feed 到期时可再对拍本表确认。
+- 原始响应见下文「基线用途」之后不再赘述 —— 复测请重新拉取：
+
+```bash
+curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
+```
+
 ## 基线用途
 
 - 改动落地并部署后，对比同一端点：feeds.active / feeds.failed、last_run 的

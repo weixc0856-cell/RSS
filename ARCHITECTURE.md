@@ -116,6 +116,8 @@ last_modified`。
 - [x] 304 保留 `etag/last-modified`：条件请求在下次抓取不退化回全量 GET。
 - [x] 前端 Feed 级健康卡片（每 feed 状态行 + dot 色，`retry in …` / `last …`）。
 - [x] 生产验收基线冻结：见 `PRODUCTION_BASELINE.md`。
+- [x] 上线落地（2026-09-03）：`rss-worker-production` v`49a72322` + Pages @ `775a5bd`
+  推送并部署；部署后 run #6 `ok`（scheduled=1/fetched=1/failed=0），见基线「部署后复测」。
 
 ## 8. 待办 / 后续
 
