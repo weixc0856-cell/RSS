@@ -175,19 +175,23 @@ fn normalize_body(body: serde_json::Value) -> serde_json::Value {
 /// Accumulate the outcome of one queued job onto its `fetch_runs` row and mark
 /// the run finished once every scheduled job has reported back.
 ///
-/// Cumulative totals after this job are the ones that decide the terminal state:
+/// Runs in two statements on purpose. A single UPDATE that both increments
+/// `feeds_fetched`/`feeds_failed` and classifies the run in a later SET clause
+/// implicitly depends on later SET clauses observing the increments made by
+/// earlier ones. Production D1 does NOT provide that: the run was observed to
+/// stay `running` forever even after every job reported, because the CASE saw
+/// the pre-update row. So we first commit the increments, then finalize from the
+/// *committed* totals in a second UPDATE — unambiguous under any evaluation
+/// semantics.
+///
 ///   new_fetched = feeds_fetched + {fetched}
 ///   new_failed  = feeds_failed  + {failed}
-/// and the run is finished once `new_fetched + new_failed >= feeds_scheduled`.
-///
-/// The `finished_at` / `status` CASE expressions below read the columns *after*
-/// the increment lines, deliberately relying on SQLite evaluating UPDATE `SET`
-/// clauses left-to-right (a later expression observes the value assigned by an
-/// earlier one). This is an intentional dependency, not an accident: it lets a
-/// single atomic statement classify the run from the new totals — equivalent to
-/// `classify_run(feeds_scheduled, new_fetched, new_failed)` — without a separate
-/// read that could race another job reporting on the same run. Keep this SQL in
-/// sync with `classify_run`.
+/// and the run is finished once `feeds_fetched + feeds_failed >= feeds_scheduled`.
+/// Both statements carry `AND status = 'running'`, so a run that is already
+/// terminal (or superseded) is never rewritten by a late/duplicate job.
+/// The second statement's terminal classification is exactly
+/// `classify_run(feeds_scheduled, feeds_fetched, feeds_failed)` on the committed
+/// row — keep them in sync.
 ///
 /// Numbers are interpolated as integer literals on purpose: the D1/worker-rs
 /// parameter binding has silently dropped bound args on this hot path before,
@@ -205,11 +209,20 @@ async fn record_run(
         Ok(db) => db,
         Err(_) => return,
     };
-    let sql = format!(
+    // 1) Commit this job's counts (no-op if the run is already terminal).
+    let increment_sql = format!(
         "UPDATE fetch_runs SET
             feeds_fetched = feeds_fetched + {fetched},
             feeds_failed = feeds_failed + {failed},
-            articles_inserted = articles_inserted + {inserted},
+            articles_inserted = articles_inserted + {inserted}
+         WHERE id = {run_id} AND status = 'running'"
+    );
+    let _ = db.prepare(&increment_sql).run().await;
+
+    // 2) Re-classify from the committed totals and close the run if complete.
+    //    Reads columns updated by statement 1 — never relies on SET order.
+    let finalize_sql = format!(
+        "UPDATE fetch_runs SET
             finished_at = CASE
                 WHEN feeds_scheduled > 0 AND feeds_fetched + feeds_failed >= feeds_scheduled
                 THEN datetime('now') ELSE finished_at END,
@@ -221,9 +234,9 @@ async fn record_run(
                     ELSE 'ok'
                 END
                 ELSE status END
-            WHERE id = {run_id} AND status = 'running'"
+         WHERE id = {run_id} AND status = 'running'"
     );
-    let _ = db.prepare(&sql).run().await;
+    let _ = db.prepare(&finalize_sql).run().await;
 }
 
 /// Terminal status of a scheduler run once all scheduled jobs have reported, or
