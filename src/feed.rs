@@ -355,6 +355,24 @@ fn parse_document(content: &str, feed_id: i32) -> Result<Vec<Article>> {
                             parsed.guid.clone()
                         };
                         let hash = FeedParser::generate_article_hash(&parsed.title, &parsed.link);
+                        // Single choke point where feed-native published timestamps
+                        // (RSS RFC822 text, Atom ISO) become the canonical sortable
+                        // UTC ISO form `YYYY-MM-DDTHH:MM:SSZ`. `ORDER BY published_at
+                        // DESC` / `MAX(published_at)` are chronological only while every
+                        // row obeys that fixed shape — so bypassing this is a contract
+                        // violation. Never lose data: an unparseable value is preserved
+                        // verbatim and logged; the row then has no sortable-time
+                        // guarantee.
+                        let published_at = parsed.published_at.as_deref().map(|raw| {
+                            crate::utils::normalize_published_at(raw).unwrap_or_else(|| {
+                                console_log!(
+                                    "[feed] failed to normalize published_at feed_id={} title={}",
+                                    feed_id,
+                                    parsed.title
+                                );
+                                raw.to_string()
+                            })
+                        });
                         articles.push(Article {
                             id: 0,
                             feed_id,
@@ -363,7 +381,7 @@ fn parse_document(content: &str, feed_id: i32) -> Result<Vec<Article>> {
                             guid,
                             summary: parsed.summary,
                             content: parsed.content,
-                            published_at: parsed.published_at,
+                            published_at,
                             hash,
                         });
                     }
@@ -489,7 +507,9 @@ mod tests {
         );
         assert_eq!(
             first.published_at.as_deref(),
-            Some("Tue, 01 Sep 2026 10:20:30 GMT")
+            // RSS pubDate is normalized to canonical UTC ISO at the write choke
+            // point — NOT kept as feed-native RFC822 text.
+            Some("2026-09-01T10:20:30Z")
         );
         assert_eq!(first.id, 0);
         assert_eq!(first.feed_id, 42);
@@ -502,7 +522,47 @@ mod tests {
         assert_eq!(second.content, None);
         assert_eq!(
             second.published_at.as_deref(),
-            Some("Wed, 02 Sep 2026 08:00:00 GMT")
+            Some("2026-09-02T08:00:00Z")
+        );
+    }
+
+    /// Write-contract test: whatever the feed-native shape, the stored
+    /// `published_at` must be canonical `YYYY-MM-DDTHH:MM:SSZ` (string sort ==
+    /// time sort). An offset pubDate is shifted to UTC, so the row's true time
+    /// ordering survives a lexicographic `ORDER BY published_at DESC`.
+    #[test]
+    fn parse_rss_normalizes_pubdate_to_canonical_utc_iso() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>Earlier in real time (12:00 +05:30 = 06:30Z)</title>
+    <link>https://example.com/a</link>
+    <pubDate>Wed, 02 Sep 2026 12:00:00 +0530</pubDate>
+  </item>
+  <item>
+    <title>Later in real time (12:00 GMT)</title>
+    <link>https://example.com/b</link>
+    <pubDate>Wed, 02 Sep 2026 12:00:00 GMT</pubDate>
+  </item>
+  <item>
+    <title>No pubDate at all — published_at stays None</title>
+    <link>https://example.com/c</link>
+  </item>
+</channel></rss>"#;
+        let articles = FeedParser::parse_rss(xml, 1).expect("parse");
+        assert_eq!(
+            articles[0].published_at.as_deref(),
+            Some("2026-09-02T06:30:00Z")
+        );
+        assert_eq!(
+            articles[1].published_at.as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+        assert_eq!(articles[2].published_at, None);
+        // 06:30Z happened before 12:00Z, and the canonical strings agree.
+        assert!(
+            articles[0].published_at < articles[1].published_at,
+            "canonical lexicographic order must match real time order"
         );
     }
 
