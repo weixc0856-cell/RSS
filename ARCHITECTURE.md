@@ -106,6 +106,27 @@ last_modified`。
 - `GET /api/diagnostics`：原字段 + `failed_feeds` 健康明细 + `last_fetch_run`。
 - `GET /api/feeds`：直接暴露健康字段供 UI 展示。
 
+### 6.1 动态 API 响应头部（v1.1：no-store + CORS allow-list）
+
+集中收尾点 `apply_api_headers()`（`src/lib.rs`）作用于每个动态 `/api/**` 响应与 OPTIONS
+预检，兼管缓存与 CORS：
+
+- **`Cache-Control: no-store`**：所有动态 API 响应默认不缓存。此前 API 无明确缓存策略，
+  浏览器/中间层/CDN 的启发式缓存行为不确定，存在“旧状态（如早期空 feed 列表）冒充当前状态”
+  的风险；`no-store` 把这一变量消除。将来若引入真正静态的 API（如 `/api/static-metadata`）
+  可另行放宽，故表述为“默认 no-store”，不写死为永久义务。
+- **`Vary: Origin`**：ACAO 依据请求 Origin 动态回显，响应代表的是“该 Origin 视角”的授权，
+  任何缓存该响应的层都必须按 Origin 键分。
+- **CORS allow-list（精确匹配，无 `*`、无通配端口/主机）**：允许集 =
+  `https://rss-intelligence.pages.dev`、`http://localhost:4321`、`http://127.0.0.1:4321`。
+  有 `Origin` 且命中 → 回显该 origin；无 `Origin`（curl、Worker 内部 scheduler/queue）或
+  未命中 → 不设 `Access-Control-Allow-Origin`。**CORS 是浏览器访问控制，不是 API 认证**：
+  服务端/curl 调用不受影响，`is_allowed_origin` 单测覆盖前缀/端口/宿主绕过负例。
+- `Access-Control-Allow-Headers: Content-Type, X-User-Id`、
+  `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`、`Max-Age: 86400`。
+- **API 错误 ≠ 空数组**：`list_feeds`/列表类错误路径返回 500，不伪装成 `[]`；真空表返回的
+  `[]` 是真“空”，前端据此区分“错误（可重试）”与“无数据”。
+
 ## 7. 本阶段已完成
 
 - [x] 链路修复：Cron→Queue→Fetch 真实打通（JSON 字符串投递 + 消费端 normalize）。
@@ -124,6 +145,27 @@ last_modified`。
   修复 commit `369d5c3` 二次部署为 v`85b8049e`（04:08:37Z 激活）；修复版首个完整周期
   run #8 `partial`（scheduled=4/fetched=1/failed=3/inserted=1，正常终结且终态粘性），
   见基线「部署后复测」。
+- [x] **v1.1 可靠性收口（2026-09-03）**：动态 `/api` 默认 `no-store` + CORS 固定 allow-list
+  与 `Vary: Origin`（§6.1）；默认源一次性 bootstrap（migration 006，见下）；前端三态
+  （loading/empty/error）+ 按区 Retry + `ApiError.code` 网络层区分；diagnostics 降级为
+  辅助信息（失败不抢主视觉）。删除 4/5/6 号不可用源并清 82 条关联文章（HTTP DELETE 是
+  存根，删除经 D1 SQL 直连）。空库自动建默认源永远在后端/migration，不在前端。
+- [x] **v1.1 上线落地（2026-09-03）**：commit `e9483af`（lib.rs）推送并部署，
+  `rss-worker-production` 部署版本 `310816af`（05:11:14Z 激活）；Pages @ `e8d511c`
+  构建并部署；006 对生产 apply 为 no-op。curl 验证：`no-store` + `Vary: Origin` 存在于
+  `/api/feeds`、`/api/health`、`/api/feeds/:id/articles`；pages.dev Origin 回显 ACAO、
+  `evil.example` 不设 ACAO、无 Origin 的 GET 正常返回 3 源。见基线「v1.1 可靠性收口」。
+
+### 7.1 默认源一次性 bootstrap（006，非 reconcile）
+
+`migrations/006_default_feeds.sql` 幂等地种入当前 3 个健康源（NYT World / BBC News /
+OpenAI News，`fetch_interval_minutes=15`、`enabled=1`、`next_fetch_at=NULL`）。三条语义契约：
+
+1. **one-time bootstrap，不是 reconcile**：`WHERE NOT EXISTS` 按 `normalized_url` 守卫，
+   只对“缺该源”的库补种；用户删除的源不会因重复执行 migration 自动复活。
+2. **`next_fetch_at = NULL` 依赖 scheduler 既有 NULL-as-due**（§5 选源条件
+   `enabled=1 AND (next_fetch_at IS NULL OR …)`），种下后首个 cron 即抓取。
+3. 对当前生产是 no-op（3 源已存在）。**空库自动加源只发生在后端/migration，前端不参与**。
 
 ## 8. 待办 / 后续
 

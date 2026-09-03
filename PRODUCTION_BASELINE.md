@@ -95,6 +95,40 @@ curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
   正常终结）。剩余 3 源健康；这也是修复版 v2 下的**首个全 `ok` run**
   （run #6 属旧代码，不作数）。
 
+## v1.1 可靠性收口（2026-09-03）
+
+部署历史（同日、在「源清理」之后）：
+
+- `rss-worker-production` v1.1 @ commit `e9483af`（`fix(api): no-store … + CORS allow-list`），
+  部署版本 `310816af`（2026-09-03T05:11:14Z 激活，紧随其后的 006 schema apply）。
+- 006 对生产 apply 为 **no-op**：3 条 `INSERT … WHERE NOT EXISTS` 均命中已有行，0 插入。
+- Pages @ commit `e8d511c`（`fix(frontend): distinct loading/empty/error states …`）构建并部署。
+
+curl 验证（`generated_at` 05:14:10Z，对 `rss-worker-production.weixc0856.workers.dev`）：
+
+| 断言 | 结果 |
+|---|---|
+| `GET /api/feeds` 等动态端点带 `Cache-Control: no-store` | ✅（`/api/feeds`、`/api/health`、`/api/feeds/1/articles` 均为 200 + no-store） |
+| `Origin: https://rss-intelligence.pages.dev` → 回显该 ACAO + `Vary: Origin` | ✅ |
+| `Origin: https://evil.example` → 不设 ACAO | ✅（浏览器侧拦截） |
+| **无 Origin** 的 `GET /api/feeds` → 200 + 3 条 + 无 ACAO | ✅（CORS≠认证：curl/服务端不受影响） |
+| `/api/health` feeds | `active 3 / failed 0 / total 3` |
+| 006 apply | no-op（feeds 仍为 3，无重复种入） |
+
+收口后首个完整周期 run #11（真实验收，`generated_at` 05:14:10Z）：
+
+| 维度 | 值 |
+|---|---|
+| scheduler.last_run.id | 11 |
+| scheduler.last_run.status | `ok`（scheduled=2，fetched=2，failed=0，articles_inserted=1） |
+| started_at / finished_at | 2026-09-03 05:00:39 / 05:01:15 |
+| feeds.active / failed / total | 3 / 0 / 3 |
+| articles.total | 1123（run #11 新插入 1 篇，源清理后的 1122 + 1） |
+
+说明：`articles.total` 由源清理时的 1122 → 1123 是**正常数据增长**（run #11 成功抓取
+插入 1 篇），不是回归。curl 的 no-Origin GET 正常返回 3 源即证明 no-store/CORS 收口
+没有影响非浏览器调用。
+
 ## 基线用途
 
 - 改动落地并部署后，对比同一端点：feeds.active / feeds.failed、last_run 的
