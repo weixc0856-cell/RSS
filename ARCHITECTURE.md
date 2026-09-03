@@ -60,6 +60,20 @@ rss-worker (rss-worker.weixc0856.workers.dev)  →  D1 rss-db-dev   （默认/�
 - 三个时间语义：`published_at`（内容方声明）、`last_fetched_at`（尝试抓取）、
   `last_success_at`（最后一次成功）、`next_fetch_at`（下次应抓时间）。
   UI 中文章时间显示 `published_at`；系统状态显示 `last_success/next_fetch`。
+- **数据平面 = `feeds` + `articles`**（抓取器写、API 读、前端调）；`rss_sources` /
+  `rss_articles` 是 dormant 用户源原型层（0 行属预期），前端从不调用 —— 不是数据丢失。
+
+### 3.1 `published_at` 排序契约（不变量，2026-09-03）
+
+- **字符串排序 ≡ 时间排序，仅当**每行 `published_at` 都是单一固定格式
+  `YYYY-MM-DDTHH:MM:SSZ`（UTC、秒级、`Z` 结尾、20 字符定长）。`ORDER BY published_at DESC`
+  与 `/api/health` 的 `MAX(published_at)` 都依赖此契约。
+- 抓取在 `parse_document` 唯一收口经 `utils::normalize_published_at` 归一：RSS RFC1123/RFC2822
+  `pubDate`（`GMT`/`±hhmm`…）与 Atom RFC3339/ISO（`Z`/`±hh:mm`，幂等）一律转 UTC ISO。
+  不可解析输入**保留原文并 `console_log`**（不丢数据，但该行无排序保证）。
+- 历史回填 = `scripts/normalize-published-at.mjs`（一次性；先部署含归一化的 Worker 再回填，
+  避免回填后旧 Worker 又写回原文）。JS 回填输出与 Rust 输出字节一致（自检表锁 Rust 单测值）。
+- code review：把 feed 原文直接写入 `published_at`（绕过归一化）视为违约。
 
 ## 4. Feed 健康与抓取治理（schema 005）
 
@@ -159,6 +173,12 @@ last_modified`。
   构建并部署；006 对生产 apply 为 no-op。curl 验证：`no-store` + `Vary: Origin` 存在于
   `/api/feeds`、`/api/health`、`/api/feeds/:id/articles`；pages.dev Origin 回显 ACAO、
   `evil.example` 不设 ACAO、无 Origin 的 GET 正常返回 3 源。见基线「v1.1 可靠性收口」。
+
+- [x] **`published_at` 归一化（2026-09-03）**：`articles.published_at` 统一为 canonical UTC
+  ISO（§3.1 不变量）。Rust `normalize_published_at` + `parse_document` 写入收口（commit
+  `cb6bcde`）+ 历史回填脚本（commit `19512e6`）。先部署 Worker（版本 `6ddaec69`）后回填
+  （1148→1148，remaining_noncanonical=0）；部署后手动抓取证明新插入行同为 canonical。见
+  `PRODUCTION_BASELINE.md`「published_at 归一化」增补。
 
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 

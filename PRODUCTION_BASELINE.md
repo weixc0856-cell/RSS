@@ -129,6 +129,52 @@ curl 验证（`generated_at` 05:14:10Z，对 `rss-worker-production.weixc0856.wo
 插入 1 篇），不是回归。curl 的 no-Origin GET 正常返回 3 源即证明 no-store/CORS 收口
 没有影响非浏览器调用。
 
+## published_at 归一化（2026-09-03）
+
+部署历史（同日）：
+
+- commit `cb6bcde`（`fix(feed): store published_at as canonical UTC ISO (sortable)`：
+  `normalize_published_at` + `parse_document` 写入收口）+ commit `19512e6`
+  （`feat(scripts): one-time published_at canonical-ISO backfill`）。
+- `rss-worker-production` 版本 `6ddaec69`（Current Version ID `6ddaec69-329d-4819-8d48-3cd219db4199`）。
+- **顺序不变量：先部署含归一化的 Worker，再回填历史** —— 避免回填完成后旧 Worker 又写回
+  RFC822 原文的窗口。
+
+回填（`node scripts/normalize-published-at.mjs --prod`）：
+
+| 指标 | 值 |
+|---|---|
+| total rows / published_at NULL | 1148 / 0 |
+| already_normalized / will_normalize / unparseable | 0 / 1148 / 0 |
+| count_before == count_after | 1148 == 1148 ✅ |
+| remaining_noncanonical == unparseable | 0 == 0 ✅ |
+| 自检表 | PASS（11 例与 Rust 单测锁定值字节一致） |
+
+SQL sanity（独立复核）：`published_at NOT GLOB`（20 字符 `YYYY-MM-DDTHH:MM:SSZ` `?` 骨架）
+非规范行 = 0；duplicate_hashes = 0；feeds = 3。
+> 注：严格的 `[0-9]`×16 括号 GLOB 被 D1 拒为 "pattern too complex"（`SQLITE_ERROR`），
+> SQL sanity 改用等长 `?` 骨架（D1 的 `?` 是单字符通配）；**权威严格校验在回填脚本内**
+> （逐行正则，remaining_noncanonical=0），此处仅作独立复核。
+
+修复后的可观测变化（`generated_at` 10:27:24Z 复查）：
+
+| 维度 | 改动前（字典序假象） | 改动后（真实时间序） |
+|---|---|---|
+| `/api/health` `newest_published_at` | `Wed, 31 May 2023 07:00:00 GMT` | `2026-09-03T10:24:26Z`（真实最新） |
+| OpenAI(feed#3) 顶部 | 2022–2024 旧文占据 `LIMIT 50` 窗口 | 2026-09-02 新文（关键症状） |
+| BBC(feed#2) 第一条 | "BBC News app"(2025) 促销文 | 2026-09-03T10:24:26Z / 10:22:18Z |
+| NYT(feed#1) | — | 仍近期 2026-09-03 在前（回归） |
+| feeds active / failed / total | — | 3 / 0 / 3 |
+| articles.total | 1148（回填后） | 1152（含下方手动抓取新插入 4 行） |
+
+运行时证明（新写入行 = canonical，不止历史回填）：
+
+- `POST /api/feeds/3/fetch`：writer 管线全量执行（last_success_at=10:25:53）；OpenAI 源
+  当时无新条目 → 0 插入，非规范行仍为 0。
+- `POST /api/feeds/2/fetch`：BBC 新出 4 条被真实插入（feed#2 81→85，articles 1148→1152），
+  新行 `published_at` 全为 canonical 且立即置顶（10:24:26Z / 10:22:18Z Gloria Steinem 文）——
+  证明下一次 cron 触发同样正确。
+
 ## 基线用途
 
 - 改动落地并部署后，对比同一端点：feeds.active / feeds.failed、last_run 的
