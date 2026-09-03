@@ -51,8 +51,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     // API routes
     let outcome = match (method, path.as_str()) {
-        // Read-only production diagnostics
+        // Read-only production diagnostics + health/freshness
         (Method::Get, "/api/diagnostics") => handle_diagnostics(env).await,
+        (Method::Get, "/api/health") => handle_health(env).await,
 
         // User-scoped RSS source CRUD (/api/sources)
         (Method::Get, "/api/sources") => {

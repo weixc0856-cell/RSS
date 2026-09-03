@@ -2,9 +2,9 @@ name = "rss-worker"
 compatibility_date = "2026-09-02"
 main = "build/worker/shim.mjs"
 
-# 每小时触发一次；cron 只负责把到期 feed 推入 RSS_FETCH_QUEUE，抓取在 queue consumer 内执行
+# 每 15 分钟唤醒 scheduler；scheduler 只按 next_fetch_at 入队到期 feed，抓取在 queue consumer 内执行
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/15 * * * *"]
 
 # 默认配置（开发环境）
 # 本文件由 scripts/render-config.ps1 从 wrangler.toml.template 渲染生成，

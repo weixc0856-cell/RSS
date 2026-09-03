@@ -9,10 +9,17 @@ pub async fn health() -> Result<Response> {
 
 pub async fn list_feeds(env: Env) -> Result<Response> {
     let db = db::get_db(&env)?;
-    let stmt = db.prepare("SELECT id, url, title, site_url, favicon_url, last_fetched_at, status FROM feeds ORDER BY id DESC");
+    let stmt = db.prepare(
+        "SELECT id, url, title, site_url, favicon_url, last_fetched_at, status,
+                error_message, enabled, fetch_interval_minutes,
+                last_success_at, last_failure_at, last_http_status,
+                consecutive_failures, next_fetch_at,
+                normalized_url, created_at, updated_at
+         FROM feeds ORDER BY id DESC",
+    );
     let rows = stmt.all().await?;
     let feeds = rows.results::<Value>()?;
-    
+
     Response::from_json(&ApiResponse {
         success: true,
         data: Some(feeds),
@@ -42,40 +49,61 @@ pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
     }
 
     let title = payload["title"].as_str().unwrap_or("RSS Feed");
+    let canonical = crate::utils::canonical_url(url);
 
     let db = db::get_db(&env)?;
-    
-    // Use parameterized query to prevent SQL injection
+
+    // Registry identity: reject duplicates by canonical URL (unique index backs this).
+    let existing = db
+        .prepare("SELECT id FROM feeds WHERE normalized_url = ?1")
+        .bind(&[canonical.clone().into()])?
+        .first::<Value>(None)
+        .await?;
+    if existing.is_some() {
+        return Response::from_json(&ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some("feed already exists".to_string()),
+        });
+    }
+
+    // New feed is due immediately (last_fetched_at IS NULL already covers this,
+    // but an explicit next_fetch_at keeps the scheduler query self-describing).
+    let interval = payload["fetch_interval_minutes"]
+        .as_i64()
+        .unwrap_or(15)
+        .clamp(5, 1440);
     let stmt = db.prepare(
-        "INSERT INTO feeds (url, title, status) VALUES (?1, ?2, ?3) RETURNING *"
+        "INSERT INTO feeds (url, title, status, normalized_url, fetch_interval_minutes, next_fetch_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) RETURNING *",
     );
-    
-    match stmt.bind(&[url.into(), title.into(), "pending".into()]) {
-        Ok(bound_stmt) => {
-            match bound_stmt.first::<Value>(None).await {
-                Ok(result) => {
-                    Response::from_json(&ApiResponse {
-                        success: true,
-                        data: result,
-                        error: None,
-                    })
-                }
-                Err(e) => {
-                    Response::from_json(&ApiResponse::<()> {
-                        success: false,
-                        data: None,
-                        error: Some(format!("Failed to insert feed: {}", e)),
-                    })
-                }
-            }
-        }
-        Err(e) => {
-            Response::from_json(&ApiResponse::<()> {
+
+    let args = vec![
+        worker::d1::D1Type::Text(url),
+        worker::d1::D1Type::Text(title),
+        worker::d1::D1Type::Text("pending"),
+        worker::d1::D1Type::Text(canonical.as_str()),
+        worker::d1::D1Type::Integer(interval as i32),
+    ];
+
+    match stmt.bind_refs(args.iter()) {
+        Ok(bound_stmt) => match bound_stmt.first::<Value>(None).await {
+            Ok(result) => Response::from_json(&ApiResponse {
+                success: true,
+                data: result,
+                error: None,
+            }),
+            Err(e) => Response::from_json(&ApiResponse::<()> {
                 success: false,
                 data: None,
-                error: Some(format!("Failed to prepare statement: {}", e)),
-            })
-        }
+                error: Some(format!("Failed to insert feed: {}", e)),
+            }),
+        },
+        Err(e) => Response::from_json(&ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(format!("Failed to prepare statement: {}", e)),
+        }),
     }
 }
 
@@ -146,12 +174,16 @@ pub async fn handle_fetch_feed(feed_id: i32, env: Env) -> Result<Response> {
 }
 
 /// Read-only production diagnostics: feed status distribution, article count,
-/// failed feeds (with error_message) and cron heartbeat summary.
+/// failed feeds (with error_message), cron heartbeat summary and fetch-run
+/// lifecycle health.
 pub async fn handle_diagnostics(env: Env) -> Result<Response> {
     let db = db::get_db(&env)?;
 
     let by_status = db
-        .prepare("SELECT status, COUNT(*) AS c FROM feeds GROUP BY status ORDER BY status")
+        .prepare(
+            "SELECT status, COUNT(*) AS c FROM feeds
+             WHERE enabled = 1 GROUP BY status ORDER BY status",
+        )
         .all()
         .await?
         .results::<Value>()?;
@@ -164,8 +196,9 @@ pub async fn handle_diagnostics(env: Env) -> Result<Response> {
 
     let failed = db
         .prepare(
-            "SELECT id, title, url, error_message, last_fetched_at
-             FROM feeds WHERE status = 'error'
+            "SELECT id, title, url, error_message, last_fetched_at, last_failure_at,
+                    last_http_status, consecutive_failures, next_fetch_at
+             FROM feeds WHERE status = 'error' AND enabled = 1
              ORDER BY id LIMIT 20",
         )
         .all()
@@ -178,12 +211,108 @@ pub async fn handle_diagnostics(env: Env) -> Result<Response> {
         .await?
         .results::<Value>()?;
 
+    let last_run = db
+        .prepare(
+            "SELECT id, started_at, finished_at, trigger, run_key,
+                    feeds_scheduled, feeds_fetched, feeds_failed, articles_inserted, status
+             FROM fetch_runs ORDER BY id DESC LIMIT 1",
+        )
+        .all()
+        .await?
+        .results::<Value>()?;
+
     let data = serde_json::json!({
         "feeds_by_status": by_status,
         "articles_total": articles_total,
         "failed_feeds": failed,
         "cron_ticks": cron,
+        "last_fetch_run": last_run.first(),
         "generated_at": crate::utils::current_timestamp(),
+    });
+
+    Response::from_json(&ApiResponse {
+        success: true,
+        data: Some(data),
+        error: None,
+    })
+}
+
+/// Production health / freshness endpoint so the frontend can distinguish
+/// "the news itself is old" from "the RSS pipeline is stale".
+pub async fn handle_health(env: Env) -> Result<Response> {
+    let db = db::get_db(&env)?;
+    let environment = env
+        .var("ENVIRONMENT")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let counts = db
+        .prepare(
+            "SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS failed
+             FROM feeds WHERE enabled = 1",
+        )
+        .all()
+        .await?
+        .results::<Value>()?;
+    let c = counts.first().cloned().unwrap_or_default();
+
+    let articles = db
+        .prepare(
+            "SELECT COUNT(*) AS total,
+                    MAX(published_at) AS newest_published,
+                    MAX(created_at) AS newest_stored
+             FROM articles",
+        )
+        .all()
+        .await?
+        .results::<Value>()?;
+    let a = articles.first().cloned().unwrap_or_default();
+
+    let last_run = db
+        .prepare(
+            "SELECT id, started_at, finished_at, feeds_scheduled, feeds_fetched,
+                    feeds_failed, articles_inserted, status
+             FROM fetch_runs ORDER BY id DESC LIMIT 1",
+        )
+        .all()
+        .await?
+        .results::<Value>()?
+        .into_iter()
+        .next()
+        .unwrap_or(serde_json::json!({}));
+
+    let oldest_success = db
+        .prepare(
+            "SELECT MIN(last_success_at) AS oldest FROM feeds
+             WHERE enabled = 1 AND status = 'active'",
+        )
+        .all()
+        .await?
+        .results::<Value>()?
+        .first()
+        .cloned()
+        .unwrap_or_default();
+
+    let data = serde_json::json!({
+        "environment": environment,
+        "generated_at": crate::utils::current_timestamp(),
+        "feeds": {
+            "total": c["total"].as_i64().unwrap_or(0),
+            "active": c["active"].as_i64().unwrap_or(0),
+            "failed": c["failed"].as_i64().unwrap_or(0),
+        },
+        "articles": {
+            "total": a["total"].as_i64().unwrap_or(0),
+            "newest_published_at": a["newest_published"],
+            "newest_stored_at": a["newest_stored"],
+        },
+        "scheduler": {
+            "last_run": last_run,
+            "oldest_successful_feed_at": oldest_success["oldest"],
+        },
     });
 
     Response::from_json(&ApiResponse {

@@ -13,7 +13,9 @@ pub struct FeedParser;
 
 impl FeedParser {
     pub async fn fetch_feed(url: &str) -> Result<Vec<Article>> {
-        let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
+        let mut response =
+            fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?, &[])
+                .await?;
         if !(200..300).contains(&response.status_code()) {
             return Err(Error::RustError(format!("feed returned HTTP {}", response.status_code())));
         }
@@ -47,17 +49,20 @@ fn d1_text_or_null(value: &Option<String>) -> D1Type<'_> {
 /// Shared outbound HTTP helper (browser-like UA). Used by the legacy feed
 /// pipeline and the user-scoped `rss_sources` pipeline.
 pub(crate) async fn fetch_remote(url: &Url) -> Result<worker::Response> {
-    fetch_with_ua(url).await
+    fetch_with_ua(url, &[]).await
 }
 
 /// Send an outbound GET for a feed with a browser-like `User-Agent`, which a
 /// number of publishers use to decide whether to serve RSS or block bots.
-async fn fetch_with_ua(url: &Url) -> Result<worker::Response> {
+async fn fetch_with_ua(url: &Url, extra: &[(&str, &str)]) -> Result<worker::Response> {
     let mut headers = Headers::new();
     headers.set(
         "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     )?;
+    for (name, value) in extra {
+        let _ = headers.set(name, value);
+    }
 
     let mut init = RequestInit::new();
     init.with_method(Method::Get).with_headers(headers);
@@ -65,35 +70,112 @@ async fn fetch_with_ua(url: &Url) -> Result<worker::Response> {
     Fetch::Request(request).send().await
 }
 
-pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
+const DEFAULT_FETCH_INTERVAL_MINUTES: i64 = 15;
+const MAX_BACKOFF_MINUTES: i64 = 24 * 60;
+
+fn backoff_minutes(interval: i64, consecutive_failures: i64) -> i64 {
+    let shift = consecutive_failures.clamp(0, 6) as u32;
+    let base = interval.max(5);
+    (base * 2i64.pow(shift)).min(MAX_BACKOFF_MINUTES)
+}
+
+fn response_header(response: &worker::Response, name: &str) -> Option<String> {
+    response.headers().get(name).ok().flatten()
+}
+
+pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
     let db = env.d1("rss_db")?;
-    let feed = db
-        .prepare("SELECT id, url, title, site_url, favicon_url, last_fetched_at, status FROM feeds WHERE url = ?1")
+    let row = db
+        .prepare(
+            "SELECT id, url, fetch_interval_minutes, consecutive_failures, etag, last_modified
+             FROM feeds WHERE url = ?1",
+        )
         .bind(&[url.into()])?
-        .first::<Feed>(None)
+        .first::<serde_json::Value>(None)
         .await?
         .ok_or_else(|| Error::RustError("feed not found".to_string()))?;
 
-    console_log!("[feed] fetch start feed_id={} url={}", feed.id, url);
-    let mut response = fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?).await?;
-    if !(200..300).contains(&response.status_code()) {
-        let message = format!("feed returned HTTP {}", response.status_code());
-        console_error!("[feed] http error feed_id={} {}", feed.id, message);
-        update_feed_status(&db, feed.id, "error", Some(message.clone())).await?;
+    let feed_id = row["id"].as_i64().unwrap_or(0) as i32;
+    if feed_id <= 0 {
+        return Err(Error::RustError("feed id missing".to_string()));
+    }
+    let interval = row["fetch_interval_minutes"]
+        .as_i64()
+        .unwrap_or(DEFAULT_FETCH_INTERVAL_MINUTES);
+    let consecutive_failures = row["consecutive_failures"].as_i64().unwrap_or(0);
+    let etag = row["etag"].as_str().map(|s| s.to_string());
+    let last_modified = row["last_modified"].as_str().map(|s| s.to_string());
+
+    console_log!("[feed] fetch start feed_id={} url={}", feed_id, url);
+
+    // Conditional GET when the origin previously gave us validators.
+    let mut conditional = Vec::new();
+    for (name, value) in [
+        ("If-None-Match", etag.as_deref()),
+        ("If-Modified-Since", last_modified.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if !value.is_empty() {
+                conditional.push((name, value));
+            }
+        }
+    }
+
+    let mut response = fetch_with_ua(
+        &Url::parse(url).map_err(|e| Error::RustError(e.to_string()))?,
+        &conditional,
+    )
+    .await?;
+    let status = response.status_code() as i32;
+
+    // 304 Not Modified => content unchanged; counts as success (fresh), no
+    // parsing. Re-store the validators we just sent: the origin did not give us
+    // new ones, so keep the old etag/last_modified or the next fetch degrades to
+    // an unconditional full GET.
+    if status == 304 {
+        console_log!("[feed] 304 not modified feed_id={}", feed_id);
+        mark_success(
+            &db,
+            feed_id,
+            304,
+            interval,
+            etag.clone(),
+            last_modified.clone(),
+        )
+        .await?;
+        return Ok(0);
+    }
+
+    if !(200..300).contains(&status) {
+        let message = format!("feed returned HTTP {status}");
+        console_error!("[feed] http error feed_id={} {message}", feed_id);
+        mark_failure(&db, feed_id, status, Some(message.clone()), interval, consecutive_failures)
+            .await?;
         return Err(Error::RustError(message));
     }
 
+    let new_etag = response_header(&response, "etag").filter(|v| !v.is_empty());
+    let new_last_modified = response_header(&response, "last-modified").filter(|v| !v.is_empty());
+
+    let before = count_articles(&db, feed_id).await?;
     let content = response.text().await?;
-    let articles = match parse_document(&content, feed.id) {
+    let articles = match parse_document(&content, feed_id) {
         Ok(articles) => articles,
         Err(error) => {
-            console_error!("[feed] parse error feed_id={}: {}", feed.id, error);
-            update_feed_status(&db, feed.id, "error", Some(error.to_string())).await?;
+            console_error!("[feed] parse error feed_id={}: {}", feed_id, error);
+            mark_failure(
+                &db,
+                feed_id,
+                status,
+                Some(error.to_string()),
+                interval,
+                consecutive_failures,
+            )
+            .await?;
             return Err(error);
         }
     };
 
-    let mut stored = 0usize;
     for article in articles.into_iter().take(MAX_ARTICLES_PER_FETCH) {
         let args = [
             D1Type::Integer(article.feed_id),
@@ -113,32 +195,99 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<()> {
         .bind_refs(args.iter())?
         .run()
         .await?;
-        stored += 1;
     }
+    let after = count_articles(&db, feed_id).await?;
+    let inserted = after.saturating_sub(before);
 
     console_log!(
-        "[feed] fetch ok feed_id={} parsed_articles={} stored_attempts={}",
-        feed.id,
+        "[feed] fetch ok feed_id={} parsed_articles={} inserted={}",
+        feed_id,
         MAX_ARTICLES_PER_FETCH,
-        stored
+        inserted
     );
-    update_feed_status(&db, feed.id, "active", None).await
+    mark_success(&db, feed_id, status, interval, new_etag, new_last_modified).await?;
+    Ok(inserted as usize)
 }
 
-async fn update_feed_status(
+async fn count_articles(db: &worker::D1Database, feed_id: i32) -> Result<i64> {
+    let row = db
+        .prepare("SELECT COUNT(*) AS c FROM articles WHERE feed_id = ?1")
+        .bind(&[feed_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    Ok(row.and_then(|v| v["c"].as_i64()).unwrap_or(0))
+}
+
+
+/// Feed fetch succeeded: refresh health fields and schedule the next window.
+async fn mark_success(
     db: &worker::D1Database,
     feed_id: i32,
-    status: &str,
-    error_message: Option<String>,
+    http_status: i32,
+    interval: i64,
+    etag: Option<String>,
+    last_modified: Option<String>,
 ) -> Result<()> {
+    let next = crate::utils::sqlite_now_plus_minutes(interval.max(DEFAULT_FETCH_INTERVAL_MINUTES));
+    let etag_arg = etag.as_deref().map(D1Type::Text).unwrap_or(D1Type::Null);
+    let lm_arg = last_modified.as_deref().map(D1Type::Text).unwrap_or(D1Type::Null);
     let args = [
-        D1Type::Text(status),
-        d1_text_or_null(&error_message),
+        D1Type::Integer(http_status),
+        etag_arg,
+        lm_arg,
+        D1Type::Text(&next),
         D1Type::Integer(feed_id),
     ];
     db.prepare(
-        "UPDATE feeds SET status = ?1, error_message = ?2, last_fetched_at = CURRENT_TIMESTAMP,
-         updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+        "UPDATE feeds SET
+            status = 'active',
+            error_message = NULL,
+            last_fetched_at = datetime('now'),
+            last_success_at = datetime('now'),
+            last_http_status = ?1,
+            consecutive_failures = 0,
+            etag = ?2,
+            last_modified = ?3,
+            next_fetch_at = ?4,
+            updated_at = datetime('now')
+         WHERE id = ?5",
+    )
+    .bind_refs(args.iter())?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Feed fetch failed: record the failure and back off exponentially so a broken
+/// origin (e.g. HTTP 503) is not hammered every scheduler cycle.
+async fn mark_failure(
+    db: &worker::D1Database,
+    feed_id: i32,
+    http_status: i32,
+    error_message: Option<String>,
+    interval: i64,
+    consecutive_failures: i64,
+) -> Result<()> {
+    let failures = consecutive_failures + 1;
+    let next = crate::utils::sqlite_now_plus_minutes(backoff_minutes(interval, failures));
+    let args = [
+        D1Type::Integer(http_status),
+        d1_text_or_null(&error_message),
+        D1Type::Integer(failures as i32),
+        D1Type::Text(&next),
+        D1Type::Integer(feed_id),
+    ];
+    db.prepare(
+        "UPDATE feeds SET
+            status = 'error',
+            last_fetched_at = datetime('now'),
+            last_failure_at = datetime('now'),
+            last_http_status = ?1,
+            error_message = ?2,
+            consecutive_failures = ?3,
+            next_fetch_at = ?4,
+            updated_at = datetime('now')
+         WHERE id = ?5",
     )
     .bind_refs(args.iter())?
     .run()
