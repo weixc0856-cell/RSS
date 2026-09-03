@@ -95,6 +95,9 @@ last_modified`。
 - **终态粘性**：`fetch_runs` 记帐 UPDATE 带 `AND status='running'` 守卫且按**累计**计数
   （`>= feeds_scheduled`）判定，迟到/重复/retry job 不会把已终结或被 supersede 的 run 翻案；
   有失败即 `partial`/`failed`，最后一条 job 成功也不会把整场 run 标成 `ok`。
+- **记帐分两条语句**：先 commit 本 job 计数（增量 UPDATE），再按**已提交**累计数定终态。
+  单条 UPDATE 在同一 SET 里"先增量、后读新列"依赖 SQLite 从左到右可见性，在 D1 上读到的是
+  更新前快照、终态永不触发（见 `PRODUCTION_BASELINE.md` 部署后复测），故不得合并回单条。
 
 ## 6. API 可观测性
 
@@ -116,8 +119,11 @@ last_modified`。
 - [x] 304 保留 `etag/last-modified`：条件请求在下次抓取不退化回全量 GET。
 - [x] 前端 Feed 级健康卡片（每 feed 状态行 + dot 色，`retry in …` / `last …`）。
 - [x] 生产验收基线冻结：见 `PRODUCTION_BASELINE.md`。
-- [x] 上线落地（2026-09-03）：`rss-worker-production` v`49a72322` + Pages @ `775a5bd`
-  推送并部署；部署后 run #6 `ok`（scheduled=1/fetched=1/failed=0），见基线「部署后复测」。
+- [x] 上线落地（2026-09-03）：Pages @ `775a5bd` 推送并部署；`rss-worker-production`
+  首版 v`49a72322` 暴露 record_run 单条 UPDATE 在 D1 上不终结的缺陷（run #7 卡 `running`），
+  修复 commit `369d5c3` 二次部署为 v`85b8049e`（04:08:37Z 激活）；修复版首个完整周期
+  run #8 `partial`（scheduled=4/fetched=1/failed=3/inserted=1，正常终结且终态粘性），
+  见基线「部署后复测」。
 
 ## 8. 待办 / 后续
 

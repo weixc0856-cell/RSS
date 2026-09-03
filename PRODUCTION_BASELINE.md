@@ -36,27 +36,37 @@ curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
 {"success":true,"data":{"articles":{"newest_published_at":"Wed, 31 May 2023 07:00:00 GMT","newest_stored_at":"2026-09-03 03:01:20","total":1203},"environment":"production","feeds":{"active":3,"failed":3,"total":6},"generated_at":"2026-09-03T03:43:34.677+00:00","scheduler":{"last_run":{"articles_inserted":0,"feeds_failed":3,"feeds_fetched":2,"feeds_scheduled":5,"finished_at":"2026-09-03 03:31:35","id":5,"started_at":"2026-09-03 03:30:38","status":"partial"},"oldest_successful_feed_at":"2026-09-03 03:16:10"}},"error":null}
 ```
 
-## 部署后复测（2026-09-03，修复版已上线）
+## 部署后复测（2026-09-03，修复版 v2 已上线）
 
-- 部署对象：`rss-worker-production` Version `49a72322-8f3e-42ed-a049-c752b8600254`
-  （commit `775a5bd`，`feat(frontend)` 至 `chore(data)` 5 个 commit 推送 + 部署）；
-  Pages production 同步到 commit `775a5bd`。
-- 部署后快照（`generated_at` 2026-09-03T03:55:58 UTC）：
+部署历史（同日、同 commit 序列）：
+
+- Pages production @ commit `775a5bd`（`feat(frontend)` 起 5 个 commit 推送 + 部署）。
+- `rss-worker-production` v1 `49a72322`（03:55:08Z 激活）：record_run 采用"单条 UPDATE
+  先增量、后在同一 SET 里按新列值定终态"，**依赖 SQLite SET 从左到右可见性 —— 在 D1 上不成立**
+  （实测终态 CASE 读到的是更新前快照）。run #6（03:45，旧代码）与 run #7（04:00，v1）
+  均未能说明问题；#7 两个 job 全回报后仍一直 `running`，直至 04:15 被调度器 supersede。
+  该缺陷用本地 SQLite 精确复现（单语句法终态同为 `('running', 2, 0, None)`）。
+- 修复 commit `369d5c3`：record_run 拆为两步 —— 先累计（`AND status='running'`），
+  再按**已提交**累计数定终态（不再依赖 SET 顺序）。
+- `rss-worker-production` v2 `85b8049e`（04:08:37Z 激活，commit `369d5c3`）。
+
+修复版首个完整周期 run #8（混合路径 = 真实验收，`generated_at` 04:16:43 UTC）：
 
 | 维度 | 值 |
 |---|---|
+| scheduler.last_run.id | 8 |
+| scheduler.last_run.status | `partial`（feeds_scheduled=4，feeds_fetched=1，feeds_failed=3，articles_inserted=1） |
+| scheduler.last_run.started_at / finished_at | 2026-09-03 04:15:37 / 04:16:34（约 57s 正常终结） |
 | feeds.active / failed / total | 3 / 3 / 6 |
-| articles.total | 1203 |
-| scheduler.last_run.id | 6 |
-| scheduler.last_run.status | `ok`（feeds_scheduled=1，feeds_fetched=1，feeds_failed=0） |
-| scheduler.last_run.started_at / finished_at | 2026-09-03 03:45:38 / 03:46:11 |
+| articles.total | 1204（run #8 成功源新插入 1 篇） |
+| 20s 后复查 | status 仍 `partial`、`finished_at` 不变（终态粘性成立） |
 
-- 说明：run #6 是部署后第一个完整周期，`scheduled 1 = fetched 1`、`status ok`、
-  `finished_at` 置位 —— 累计记账 + 终态判定在真实链路上工作正常。
-  该 run 无失败，`partial`/`failed` 分支由单元测试（`classify_run` 边界：
-  `(2,2,1)→partial`、`(2,3,0)→ok` 等，48 用例全绿）覆盖；后续自然 cron 周期
-  出现失败 feed 到期时可再对拍本表确认。
-- 原始响应见下文「基线用途」之后不再赘述 —— 复测请重新拉取：
+说明：run #8 对应 3 个 Google News 503 feed 到期重试失败 + 1 个成功源（新插入 1 篇）：
+累计 4 = 4（fetched 1 + failed 3）即终结为 `partial`，与实际失败一致。
+对比改动前 run #5 同为 `partial`（scheduled=5/fetched=2/failed=3）—— v2 下 run 可正常
+终结且 `partial`/`ok` 判定不再受"最后一条 job 成败"干扰。
+
+复测 / 对拍请重新拉取，勿以此文件替代健康检查：
 
 ```bash
 curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
