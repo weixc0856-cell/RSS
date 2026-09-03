@@ -6,9 +6,10 @@ import {
   getDiagnostics,
   getFeeds,
   timeAgo,
+  timeUntil,
   triggerFetch,
 } from "../lib/api";
-import type { Article, Diagnostics, EnvKey, Feed } from "../lib/types";
+import type { Article, Diagnostics, Feed } from "../lib/types";
 import { initMotion, refreshMotion } from "./animate";
 
 /** App controller: owns UI state and rendering. Data access only via lib/api. */
@@ -30,15 +31,12 @@ const els = {
   search: $<HTMLInputElement>("search"),
   sort: $<HTMLSelectElement>("sort"),
   refresh: $<HTMLButtonElement>("refresh"),
-  envDev: $<HTMLButtonElement>("envDev"),
-  envProd: $<HTMLButtonElement>("envProd"),
   feedForm: $<HTMLFormElement>("feedForm"),
   feedUrl: $<HTMLInputElement>("feedUrl"),
   feedTitle: $<HTMLInputElement>("feedTitle"),
   toast: $<HTMLElement>("toast"),
 };
 
-let env: EnvKey = (localStorage.getItem("rss-env") as EnvKey) || "dev";
 let feeds: Feed[] = [];
 let articles: Article[] = [];
 let activeFeedId: number | null = null;
@@ -66,19 +64,57 @@ function feedById(id: number): Feed | undefined {
   return feeds.find((f) => f.id === id);
 }
 
-function renderEnvSwitch(): void {
-  els.envDev.classList.toggle("active", env === "dev");
-  els.envProd.classList.toggle("active", env === "prod");
+interface HealthLine {
+  tone: "ok" | "err" | "warn";
+  badge: string;
+  detail: string;
+}
+
+/** Derive the per-feed health line from the fields `/api/feeds` already sends. */
+function feedHealth(f: Feed): HealthLine {
+  if (f.status === "error") {
+    const code = f.last_http_status ? `HTTP ${f.last_http_status}` : "HTTP ?";
+    const retries =
+      (f.consecutive_failures ?? 0) > 0 ? ` · ×${f.consecutive_failures}` : "";
+    return {
+      tone: "err",
+      badge: `Failed · ${code}`,
+      detail: `retry ${timeUntil(f.next_fetch_at ?? null)}${retries}`,
+    };
+  }
+  if (f.status === "active") {
+    return {
+      tone: "ok",
+      badge: "Healthy",
+      detail: `last ${timeAgo(f.last_success_at ?? f.last_fetched_at ?? null)}`,
+    };
+  }
+  return {
+    tone: "warn",
+    badge: f.status || "Queued",
+    detail: "never fetched",
+  };
 }
 
 function renderNav(): void {
   const html = feeds
     .map((f) => {
       const title = escapeHtml(f.title || domainOf(f.url));
-      const cls = f.status === "error" ? "dot error" : "dot";
+      const health = feedHealth(f);
+      const dotCls = `dot ${health.tone}`;
+      const metaErr = health.tone === "err" ? "err" : "";
       const active = f.id === activeFeedId ? "active" : "";
-      return `<button class="nav-item ${active}" type="button" data-feed="${f.id}">
-        <span class="${cls}"></span><span>${title}</span>
+      const tip = `${health.badge} · ${health.detail}`;
+      return `<button class="nav-item ${active}" type="button" data-feed="${f.id}" title="${escapeHtml(
+        tip
+      )}">
+        <span class="nav-row">
+          <span class="${dotCls}"></span><span class="nav-title">${title}</span>
+        </span>
+        <span class="nav-meta ${metaErr}">
+          <span class="health-badge">${escapeHtml(health.badge)}</span>
+          <span>${escapeHtml(health.detail)}</span>
+        </span>
       </button>`;
     })
     .join("");
@@ -93,11 +129,14 @@ function renderStats(): void {
   const total = diagnostics.articles_total[0]?.total ?? 0;
   const active = byStatus["active"] ?? 0;
   const errors = byStatus["error"] ?? 0;
-  const tick = diagnostics.cron_ticks[0];
-  const lastTick = tick?.last_tick ? ` · cron ${timeAgo(tick.last_tick)}` : "";
+  const run = diagnostics.last_fetch_run;
+  const lastSync = run?.started_at ?? diagnostics.cron_ticks[0]?.last_tick ?? null;
+  const runFailed = run?.feeds_failed ?? 0;
 
   els.healthDot.classList.toggle("error", errors > 0);
-  els.healthText.textContent = `${env} · ${active} active · ${errors} errors${lastTick}`;
+  els.healthText.textContent = `${active} active · ${errors} failed · sync ${timeAgo(
+    lastSync
+  )}${runFailed ? ` · ${runFailed} failed this run` : ""}`;
   els.subtitle.textContent = `${active} live feeds · ${total} articles stored`;
 
   const stat = (value: string | number, label: string): string =>
@@ -107,7 +146,7 @@ function renderStats(): void {
     stat(active, "Active feeds") +
     stat(errors, "Failed feeds") +
     stat(total, "Articles") +
-    stat(env.toUpperCase(), "Environment");
+    stat(timeAgo(lastSync), "Last sync");
 }
 
 function visibleArticles(): Article[] {
@@ -163,7 +202,7 @@ async function loadArticles(): Promise<void> {
     return;
   }
   els.items.innerHTML = `<div class="skeleton"></div>`;
-  articles = await getArticles(env, activeFeedId);
+  articles = await getArticles(activeFeedId);
   renderItems();
 }
 
@@ -172,10 +211,7 @@ async function loadAll(): Promise<void> {
     els.subtitle.textContent = "Loading…";
     els.refresh.disabled = true;
 
-    const [feedList, diag] = await Promise.all([
-      getFeeds(env),
-      getDiagnostics(env),
-    ]);
+    const [feedList, diag] = await Promise.all([getFeeds(), getDiagnostics()]);
     feeds = feedList;
     diagnostics = diag;
 
@@ -186,7 +222,6 @@ async function loadAll(): Promise<void> {
     activeFeedId = keep;
 
     renderNav();
-    renderEnvSwitch();
     renderStats();
     await loadArticles();
   } catch (err) {
@@ -220,7 +255,7 @@ els.refresh.addEventListener("click", async () => {
   }
   try {
     els.refresh.textContent = "↻ Syncing…";
-    await triggerFetch(env, activeFeedId);
+    await triggerFetch(activeFeedId);
     await loadAll();
     toast("Feed refreshed");
   } catch (err) {
@@ -230,24 +265,13 @@ els.refresh.addEventListener("click", async () => {
   }
 });
 
-els.envDev.addEventListener("click", () => {
-  env = "dev";
-  localStorage.setItem("rss-env", env);
-  void loadAll();
-});
-els.envProd.addEventListener("click", () => {
-  env = "prod";
-  localStorage.setItem("rss-env", env);
-  void loadAll();
-});
-
 els.feedForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const url = els.feedUrl.value.trim();
   const title = els.feedTitle.value.trim() || domainOf(url);
   if (!url) return;
   try {
-    await addFeed(env, url, title);
+    await addFeed(url, title);
     els.feedUrl.value = "";
     els.feedTitle.value = "";
     await loadAll();
@@ -258,6 +282,5 @@ els.feedForm.addEventListener("submit", async (event) => {
 });
 
 // --- Boot -------------------------------------------------------------------
-renderEnvSwitch();
 initMotion();
 void loadAll();

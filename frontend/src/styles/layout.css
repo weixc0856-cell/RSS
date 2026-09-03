@@ -65,11 +65,12 @@
   width: 100%;
   border: 0;
   background: transparent;
-  padding: 9px 11px;
+  padding: 8px 11px;
   border-radius: 10px;
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
   color: #565650;
   text-align: left;
   cursor: pointer;
@@ -85,14 +86,49 @@
   color: #fff;
 }
 
-.nav-count {
-  margin-left: auto;
-  font-size: 11px;
-  color: #999;
+.nav-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
-.nav-item.active .nav-count {
-  color: #bbb;
+.nav-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+  font-size: 13px;
+  letter-spacing: -0.01em;
+}
+
+/* Second line of a nav item: per-feed health derived in feedHealth(). */
+.nav-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding-left: 17px;
+  font-size: 11px;
+  line-height: 1.15;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.nav-meta .health-badge {
+  font-weight: 700;
+}
+
+.nav-meta.err {
+  color: var(--accent);
+}
+
+.nav-item.active .nav-meta {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.nav-item.active .nav-meta.err {
+  color: rgba(255, 255, 255, 0.88);
 }
 
 .sidebar-bottom {
@@ -122,6 +158,11 @@
 .dot.error {
   background: var(--accent);
   box-shadow: 0 0 0 4px rgba(200, 75, 47, 0.1);
+}
+
+.dot.warn {
+  background: var(--warning);
+  box-shadow: 0 0 0 4px rgba(196, 154, 60, 0.14);
 }
 
 .main {

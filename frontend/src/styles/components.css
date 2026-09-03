@@ -57,25 +57,6 @@
   cursor: wait;
 }
 
-.env-switch {
-  display: inline-flex;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
-}
-
-.env-switch button {
-  border: 0;
-  background: var(--surface);
-  padding: 9px 12px;
-  cursor: pointer;
-}
-
-.env-switch button.active {
-  background: var(--text);
-  color: #fff;
-}
-
 /* Feed stat cards row */
 .stats {
   display: grid;

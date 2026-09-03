@@ -2,22 +2,20 @@ import type {
   ApiResponse,
   Article,
   Diagnostics,
-  EnvKey,
   Feed,
 } from "./types";
 
 /**
  * API layer: the ONLY place that talks to the Cloudflare Worker.
  * UI components never construct fetch calls themselves (data/design separation).
+ *
+ * Production data-plane rule: the production Worker (`rss-worker-production`)
+ * backed by the `rss-db` D1 database is the single source of truth. The build
+ * may override it only through the deployment config (not per-user UI state).
  */
-export const API_BASES: Record<EnvKey, string> = {
-  dev:
-    import.meta.env.ASTRO_PUBLIC_API_DEV ??
-    "https://rss-worker.weixc0856.workers.dev",
-  prod:
-    import.meta.env.ASTRO_PUBLIC_API_PROD ??
-    "https://rss-worker-production.weixc0856.workers.dev",
-};
+export const API_BASE: string =
+  import.meta.env.ASTRO_PUBLIC_API_BASE ??
+  "https://rss-worker-production.weixc0856.workers.dev";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status?: number) {
@@ -27,18 +25,17 @@ export class ApiError extends Error {
 }
 
 async function request<T>(
-  base: string,
   path: string,
   init?: RequestInit
 ): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(`${base}${path}`, {
+    res = await fetch(`${API_BASE}${path}`, {
       headers: { "Content-Type": "application/json" },
       ...init,
     });
   } catch (cause) {
-    throw new ApiError(`Network error reaching ${base}${path}`);
+    throw new ApiError(`Network error reaching ${API_BASE}${path}`);
   }
 
   let json: ApiResponse<T>;
@@ -54,32 +51,26 @@ async function request<T>(
   return json.data as T;
 }
 
-export async function getFeeds(env: EnvKey): Promise<Feed[]> {
-  return request<Feed[]>(API_BASES[env], "/api/feeds");
+export async function getFeeds(): Promise<Feed[]> {
+  return request<Feed[]>("/api/feeds");
 }
 
-export async function getArticles(env: EnvKey, feedId: number): Promise<Article[]> {
-  return request<Article[]>(API_BASES[env], `/api/feeds/${feedId}/articles`);
+export async function getArticles(feedId: number): Promise<Article[]> {
+  return request<Article[]>(`/api/feeds/${feedId}/articles`);
 }
 
-export async function getDiagnostics(env: EnvKey): Promise<Diagnostics> {
-  return request<Diagnostics>(API_BASES[env], "/api/diagnostics");
+export async function getDiagnostics(): Promise<Diagnostics> {
+  return request<Diagnostics>("/api/diagnostics");
 }
 
-export async function triggerFetch(env: EnvKey, feedId: number): Promise<{ total: number }> {
-  return request<{ total: number }>(
-    API_BASES[env],
-    `/api/feeds/${feedId}/fetch`,
-    { method: "POST" }
-  );
+export async function triggerFetch(feedId: number): Promise<{ total: number }> {
+  return request<{ total: number }>(`/api/feeds/${feedId}/fetch`, {
+    method: "POST",
+  });
 }
 
-export async function addFeed(
-  env: EnvKey,
-  url: string,
-  title: string
-): Promise<Feed> {
-  return request<Feed>(API_BASES[env], "/api/feeds", {
+export async function addFeed(url: string, title: string): Promise<Feed> {
+  return request<Feed>("/api/feeds", {
     method: "POST",
     body: JSON.stringify({ url, title }),
   });
@@ -99,6 +90,20 @@ export function timeAgo(value: string | null): string {
   if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   return `${d}d ago`;
+}
+
+/** Human friendly relative time until a future date string ("in 3m"). */
+export function timeUntil(value: string | null): string {
+  if (!value) return "soon";
+  const t = new Date(value).getTime();
+  if (Number.isNaN(t)) return "soon";
+  const diff = t - Date.now();
+  if (diff <= 60_000) return "in <1m";
+  const m = Math.floor(diff / 60_000);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `in ${h}h`;
+  return `in ${Math.floor(h / 24)}d`;
 }
 
 export function domainOf(url: string): string {
