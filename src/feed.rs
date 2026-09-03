@@ -365,11 +365,7 @@ fn parse_document(content: &str, feed_id: i32) -> Result<Vec<Article>> {
                         // guarantee.
                         let published_at = parsed.published_at.as_deref().map(|raw| {
                             crate::utils::normalize_published_at(raw).unwrap_or_else(|| {
-                                console_log!(
-                                    "[feed] failed to normalize published_at feed_id={} title={}",
-                                    feed_id,
-                                    parsed.title
-                                );
+                                log_normalize_failure(feed_id, &parsed.title);
                                 raw.to_string()
                             })
                         });
@@ -417,6 +413,17 @@ fn set_field(article: &mut ParsedArticle, field: &str, value: String) {
         "pubDate" | "published" | "updated" => article.published_at = Some(value),
         _ => {}
     }
+}
+
+/// Failure log for the published_at choke point. On wasm (the deployed Worker)
+/// this goes through worker's `console_log!`; under `cargo test` (host) that
+/// symbol is a wasm-import shim that must not be invoked at runtime, so log to
+/// stderr instead. Keeps the choke point pure and unit-testable.
+fn log_normalize_failure(feed_id: i32, title: &str) {
+    #[cfg(target_arch = "wasm32")]
+    console_log!("[feed] failed to normalize published_at feed_id={} title={}", feed_id, title);
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("[feed] failed to normalize published_at feed_id={} title={}", feed_id, title);
 }
 
 fn local_name(name: &[u8]) -> &str {
@@ -563,6 +570,61 @@ mod tests {
         assert!(
             articles[0].published_at < articles[1].published_at,
             "canonical lexicographic order must match real time order"
+        );
+    }
+
+    /// Write-contract, None path: an unparseable pubDate is preserved verbatim
+    /// (never dropped, never guessed) — the article still stores, but the row
+    /// carries no sortable-time guarantee.
+    #[test]
+    fn parse_rss_keeps_unparseable_pubdate_verbatim() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>Odd date</title>
+    <link>https://example.com/odd</link>
+    <pubDate>not a real date</pubDate>
+  </item>
+</channel></rss>"#;
+        let articles = FeedParser::parse_rss(xml, 1).expect("parse");
+        assert_eq!(articles.len(), 1);
+        assert_eq!(
+            articles[0].published_at.as_deref(),
+            Some("not a real date"),
+            "unparseable pubDate must be preserved, not dropped or guessed"
+        );
+    }
+
+    /// Write-contract for Atom: fractional-second <published> and offset
+    /// <updated> collapse to the same whole-second canonical form RSS gets.
+    #[test]
+    fn parse_atom_normalizes_fractional_and_offset_timestamps() {
+        let xml = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Fractional Atom</title>
+  <link href="https://example.com/atom"/>
+  <entry>
+    <title>Fractional published</title>
+    <id>urn:uuid:f-1</id>
+    <link href="https://example.com/f1"/>
+    <published>2026-09-02T08:30:15.250Z</published>
+  </entry>
+  <entry>
+    <title>Offset updated</title>
+    <id>urn:uuid:f-2</id>
+    <link href="https://example.com/f2"/>
+    <updated>2026-09-02T14:30:00+02:00</updated>
+  </entry>
+</feed>"#;
+        let articles = FeedParser::parse_atom(xml, 9).expect("parse");
+        assert_eq!(articles.len(), 2);
+        assert_eq!(
+            articles[0].published_at.as_deref(),
+            Some("2026-09-02T08:30:15Z")
+        );
+        assert_eq!(
+            articles[1].published_at.as_deref(),
+            Some("2026-09-02T12:30:00Z")
         );
     }
 

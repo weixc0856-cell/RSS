@@ -239,5 +239,103 @@ mod tests {
             assert!(out.starts_with("2026-09-02T"));
         }
     }
+
+    /// Atom/RFC3339 fractional seconds are legal ISO — they collapse to whole
+    /// seconds (the canonical shape has no sub-second field).
+    #[test]
+    fn normalize_published_at_iso_fractional_seconds_to_whole_seconds() {
+        assert_eq!(
+            normalize_published_at("2026-09-02T12:00:00.123Z").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("2026-09-02T12:00:00.999+00:00").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("2026-08-15T09:30:45.500+05:30").as_deref(),
+            Some("2026-08-15T04:00:45Z")
+        );
+    }
+
+    /// RFC2822 permits an unpadded 1-2 digit day-of-month, but hour/minute/second
+    /// must be 2-digit. chrono enforces exactly that, so unpadded time fields
+    /// fall through to None (caller keeps raw) rather than being guessed.
+    #[test]
+    fn normalize_published_at_rfc2822_day_unpadded_ok_time_padded_required() {
+        assert_eq!(
+            normalize_published_at("Wed, 2 Sep 2026 12:00:00 GMT").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("Wed, 2 Sep 2026 08:05:09 +0000").as_deref(),
+            Some("2026-09-02T08:05:09Z")
+        );
+        // Unpadded hour or minute/second is not RFC2822-legal — rejected.
+        assert_eq!(normalize_published_at("Wed, 2 Sep 2026 3:04:05 GMT"), None);
+        assert_eq!(normalize_published_at("Wed, 02 Sep 2026 8:0:0 +0000"), None);
+    }
+
+    /// Surrounding whitespace is tolerated (feeds occasionally pad the element).
+    #[test]
+    fn normalize_published_at_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_published_at("  Wed, 02 Sep 2026 12:00:00 GMT  ").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("\t2026-09-02T12:00:00Z\n").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+    }
+
+    /// RFC822 `-0000` means "unknown local offset" — by convention treated as
+    /// UTC, so it maps to the same canonical instant as `+0000`/`Z`.
+    #[test]
+    fn normalize_published_at_unknown_offset_minus0000_is_utc() {
+        assert_eq!(
+            normalize_published_at("Wed, 02 Sep 2026 12:00:00 -0000").as_deref(),
+            Some("2026-09-02T12:00:00Z")
+        );
+    }
+
+    /// Incomplete / zoneless forms are NOT silently promoted to a guessed time:
+    /// they fall through to None (caller keeps raw + logs).
+    #[test]
+    fn normalize_published_at_incomplete_or_zoneless_is_none() {
+        assert_eq!(normalize_published_at("2026-09-02"), None); // date only
+        assert_eq!(normalize_published_at("2026-09-02T12:00:00"), None); // no zone
+        assert_eq!(normalize_published_at("Tue, 01 Sep 2026"), None); // no time
+        assert_eq!(normalize_published_at("Yesterday"), None);
+    }
+
+    /// Idempotence across encodings: the same real instant expressed in RFC822
+    /// GMT / +0000, and ISO Z / +00:00, must converge to ONE canonical string —
+    /// the whole point of a sortable key.
+    #[test]
+    fn normalize_published_at_same_instant_across_encodings_converge() {
+        let encodings = [
+            "Wed, 02 Sep 2026 12:00:00 GMT",
+            "Wed, 02 Sep 2026 12:00:00 +0000",
+            "2026-09-02T12:00:00Z",
+            "2026-09-02T12:00:00+00:00",
+        ];
+        let canonical = encodings
+            .iter()
+            .map(|raw| normalize_published_at(raw).expect("encoding should parse"))
+            .collect::<Vec<_>>();
+        for c in &canonical {
+            assert_eq!(c, "2026-09-02T12:00:00Z", "all encodings must converge");
+        }
+        // And a non-UTC offset is shifted rather than echoed verbatim.
+        assert_eq!(
+            normalize_published_at("Wed, 02 Sep 2026 12:00:00 -0500").as_deref(),
+            normalize_published_at("2026-09-02T12:00:00-05:00").as_deref(),
+        );
+        assert_eq!(
+            normalize_published_at("2026-09-02T12:00:00-05:00").as_deref(),
+            Some("2026-09-02T17:00:00Z")
+        );
+    }
 }
 
