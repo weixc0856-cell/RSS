@@ -16,10 +16,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
     let method = req.method();
 
+    // Read the Origin before `req` is moved into the handlers below — the API
+    // post-processor needs it to decide CORS on every response.
+    let origin = req.headers().get("Origin").ok().flatten();
+
     // CORS preflight (browser UI on a different origin)
     if method == Method::Options {
         let mut response = Response::empty()?;
-        apply_cors(&mut response)?;
+        apply_api_headers(&mut response, origin.as_deref())?;
         return Ok(response);
     }
 
@@ -154,15 +158,47 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     };
 
     let mut response = outcome?;
-    apply_cors(&mut response)?;
+    apply_api_headers(&mut response, origin.as_deref())?;
     Ok(response)
 }
 
-/// Attach permissive CORS headers so the browser frontend (Cloudflare Pages)
-/// can call this Worker API cross-origin. Harden the origin list before
-/// exposing to untrusted consumers.
-fn apply_cors(response: &mut Response) -> Result<()> {
-    response.headers_mut().set("Access-Control-Allow-Origin", "*")?;
+/// Browser origins allowed to read the dynamic API cross-origin: the production
+/// Pages frontend and local `astro dev`. Exact match only — no `*`, no wildcard
+/// ports/hosts (a prefix/port bypass must never be admitted).
+const ALLOWED_ORIGINS: &[&str] = &[
+    "https://rss-intelligence.pages.dev",
+    "http://localhost:4321",
+    "http://127.0.0.1:4321",
+];
+
+fn is_allowed_origin(origin: &str) -> bool {
+    ALLOWED_ORIGINS.contains(&origin)
+}
+
+/// Central post-processor for every dynamic `/api/**` response and the OPTIONS
+/// preflight. Two jobs:
+///   1. `Cache-Control: no-store` — dynamic API responses have no explicit cache
+///      policy today, so browser/CDN heuristic caching is indeterminate; without
+///      no-store a stale response (e.g. an early empty feed list) could
+///      masquerade as the current state. Make it deterministic.
+///   2. CORS — echo the request Origin only when it is on the allow-list. A
+///      request without an `Origin` (curl, server-side scheduler/queue) or with
+///      a disallowed one gets no `Access-Control-Allow-Origin`, so the browser
+///      blocks the cross-origin read while non-browser callers are unaffected:
+///      CORS is browser access control, not API authentication.
+///
+/// Takes the Origin header value (read in `main` before `req` is moved into
+/// handlers), not the whole request.
+fn apply_api_headers(response: &mut Response, origin: Option<&str>) -> Result<()> {
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    // ACAO is chosen from the request Origin, so any cache that stores this
+    // response must key on Origin too.
+    response.headers_mut().set("Vary", "Origin")?;
+    if let Some(origin) = origin {
+        if is_allowed_origin(origin) {
+            response.headers_mut().set("Access-Control-Allow-Origin", origin)?;
+        }
+    }
     response
         .headers_mut()
         .set("Access-Control-Allow-Headers", "Content-Type, X-User-Id")?;
@@ -173,6 +209,31 @@ fn apply_cors(response: &mut Response) -> Result<()> {
         .headers_mut()
         .set("Access-Control-Max-Age", "86400")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_origins_match_exactly() {
+        assert!(is_allowed_origin("https://rss-intelligence.pages.dev"));
+        assert!(is_allowed_origin("http://localhost:4321"));
+        assert!(is_allowed_origin("http://127.0.0.1:4321"));
+    }
+
+    #[test]
+    fn disallowed_origins_are_rejected() {
+        assert!(!is_allowed_origin("https://evil.example"));
+        // Prefix of an allowed host must not slip through (exact match).
+        assert!(!is_allowed_origin("https://sub.rss-intelligence.pages.dev"));
+        assert!(!is_allowed_origin("https://rss-intelligence.pages.dev.evil.com"));
+        // Wrong / missing port and unrelated hosts.
+        assert!(!is_allowed_origin("http://localhost"));
+        assert!(!is_allowed_origin("http://localhost:4322"));
+        assert!(!is_allowed_origin("https://rss-worker-production.weixc0856.workers.dev"));
+        assert!(!is_allowed_origin(""));
+    }
 }
 
 
