@@ -221,12 +221,46 @@ pub async fn handle_diagnostics(env: Env) -> Result<Response> {
         .await?
         .results::<Value>()?;
 
+    // User-scoped source layer (dormant vs the legacy feeds board, but surfaced
+    // here so diagnostics is model-complete). Pure additive — the legacy fields
+    // above are untouched.
+    let sources_by_status = db
+        .prepare(
+            "SELECT status, COUNT(*) AS c FROM rss_sources
+             WHERE enabled = 1 GROUP BY status ORDER BY status",
+        )
+        .all()
+        .await?
+        .results::<Value>()?;
+
+    let sources_total = db
+        .prepare(
+            "SELECT (SELECT COUNT(*) FROM rss_sources) AS sources,
+                    (SELECT COUNT(*) FROM rss_articles) AS articles",
+        )
+        .all()
+        .await?
+        .results::<Value>()?
+        .first()
+        .cloned()
+        .unwrap_or_default();
+
     let data = serde_json::json!({
         "feeds_by_status": by_status,
         "articles_total": articles_total,
         "failed_feeds": failed,
         "cron_ticks": cron,
         "last_fetch_run": last_run.first(),
+        "rss_sources": {
+            "total": sources_total["sources"].as_i64().unwrap_or(0),
+            "by_status": sources_by_status,
+        },
+        // Intentionally mirrors the legacy `articles_total` array shape
+        // ([{ "total": N }]) for additive compatibility — no shape
+        // normalization is attempted in this round.
+        "rss_articles_total": serde_json::json!([
+            { "total": sources_total["articles"].as_i64().unwrap_or(0) }
+        ]),
         "generated_at": crate::utils::current_timestamp(),
     });
 
