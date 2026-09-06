@@ -10,6 +10,11 @@
   <div class="nav-label">Feeds</div>
   <nav class="nav" id="feedNav" aria-label="Feeds"></nav>
 
+  <!-- One-click subscribe suggestions: shared-pool feeds this device does not
+       yet follow. Rendered by app.ts (renderDiscover) from GET /api/feeds minus
+       the device list — pool feeds are only ever added here, never auto-added. -->
+  <div id="discover" class="discover" aria-label="Discover shared feeds"></div>
+
   <div class="sidebar-bottom">
     <form class="feed-form" id="feedForm">
       <input

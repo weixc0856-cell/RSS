@@ -25,6 +25,27 @@ export interface Feed {
   normalized_url?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  /** Only present on rows from /api/me/feeds (the per-device list). */
+  subscribed_at?: string | null;
+  /** Only present on rows from /api/me/feeds. */
+  article_count?: number;
+}
+
+/** POST /api/feeds (find-or-create + subscribe THIS device) response data.
+ *  `created` = brand-new in the shared pool; `already` = this device was
+ *  already subscribed before this call. Drives honest add-form copy. */
+export interface AddFeedResult {
+  feed: Feed;
+  created: boolean;
+  already: boolean;
+}
+
+/** DELETE /api/feeds/:id (unsubscribe THIS device) response data.
+ *  `pruned` = this was the last subscriber, so the feed + its articles were
+ *  removed from the shared pool too. */
+export interface DeleteResult {
+  id: number;
+  pruned: boolean;
 }
 
 export interface Article {

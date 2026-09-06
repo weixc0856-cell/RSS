@@ -1,6 +1,8 @@
 import type {
+  AddFeedResult,
   ApiResponse,
   Article,
+  DeleteResult,
   Diagnostics,
   Feed,
 } from "./types";
@@ -12,6 +14,12 @@ import type {
  * Production data-plane rule: the production Worker (`rss-worker-production`)
  * backed by the `rss-db` D1 database is the single source of truth. The build
  * may override it only through the deployment config (not per-user UI state).
+ *
+ * Device model: each browser owns an independent subscription list. The random
+ * key minted below travels as the `X-User-Id` header on every request. It names
+ * a device *namespace*, NOT a login: anyone may mint any key, and collisions
+ * are merely improbable, never impossible (see ARCHITECTURE.md §3). Where a
+ * key is stored is per-browser only — there is no cross-device sync.
  */
 export const API_BASE: string =
   import.meta.env.ASTRO_PUBLIC_API_BASE ??
@@ -30,14 +38,63 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(
-  path: string,
-  init?: RequestInit
-): Promise<T> {
+const DEVICE_KEY_STORAGE = "rss_device_key";
+let memoryKey: string | null = null;
+
+function makeDeviceKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // fall through to the non-crypto fallback
+    }
+  }
+  // Non-secure context or crypto unavailable: still a unique-enough namespace
+  // key for isolation (collision probability, not a security boundary).
+  return `dev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
+ * This browser's stable device key, minted on first call and persisted in
+ * localStorage. localStorage can be disabled (private mode, blocked storage) —
+ * then the key lives only for this page session and a reload looks like a new
+ * device, which the model tolerates (isolation is per-browser by design).
+ */
+export function getDeviceKey(): string {
+  if (memoryKey) return memoryKey;
+  try {
+    const stored = window.localStorage.getItem(DEVICE_KEY_STORAGE);
+    if (stored) {
+      memoryKey = stored;
+      return stored;
+    }
+  } catch {
+    // localStorage unavailable — fall through to an in-memory key.
+  }
+  const fresh = makeDeviceKey();
+  memoryKey = fresh;
+  try {
+    window.localStorage.setItem(DEVICE_KEY_STORAGE, fresh);
+  } catch {
+    // Keep the in-memory key for this session.
+  }
+  return fresh;
+}
+
+function baseHeaders(): Record<string, string> {
+  // The custom X-User-Id header makes every request preflight; the worker
+  // re-advertises it in Access-Control-Allow-Headers.
+  return {
+    "Content-Type": "application/json",
+    "X-User-Id": getDeviceKey(),
+  };
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
+      headers: baseHeaders(),
       ...init,
     });
   } catch {
@@ -61,8 +118,27 @@ async function request<T>(
   return json.data as T;
 }
 
+/** Shared-pool catalog — DISCOVER-ONLY. The feed nav MUST NEVER derive from
+ *  this list (invariant, see ARCHITECTURE.md): a new device has its own empty
+ *  list while the pool stays full. Feed the Discover strip from here, the nav
+ *  from getMyFeeds(). */
 export async function getFeeds(): Promise<Feed[]> {
   return request<Feed[]>("/api/feeds");
+}
+
+/** THIS device's feed list — NAVIGATION-ONLY. The only source the sidebar nav
+ *  may read. Same feed projection as /api/feeds plus subscribed_at and
+ *  article_count. Requires the X-User-Id header. */
+export async function getMyFeeds(): Promise<Feed[]> {
+  return request<Feed[]>("/api/me/feeds");
+}
+
+/** Subscribe THIS device to an existing shared-pool feed (Discover "+").
+ *  Idempotent. */
+export async function subscribeFeed(feedId: number): Promise<Feed> {
+  return request<Feed>(`/api/feeds/${feedId}/subscribe`, {
+    method: "POST",
+  });
 }
 
 export async function getArticles(feedId: number): Promise<Article[]> {
@@ -79,16 +155,20 @@ export async function triggerFetch(feedId: number): Promise<{ total: number }> {
   });
 }
 
-export async function addFeed(url: string, title: string): Promise<Feed> {
-  return request<Feed>("/api/feeds", {
+/** Find-or-create a shared-pool feed for this URL and subscribe THIS device.
+ *  Idempotent, always success on a valid body — created/already tell the story. */
+export async function addFeed(url: string, title: string): Promise<AddFeedResult> {
+  return request<AddFeedResult>("/api/feeds", {
     method: "POST",
     body: JSON.stringify({ url, title }),
   });
 }
 
-/** Global feed deletion — removes the feed and every article it stored. */
-export async function deleteFeed(feedId: number): Promise<{ id: number }> {
-  return request<{ id: number }>(`/api/feeds/${feedId}`, {
+/** Unsubscribe THIS device from a pool feed. When the last subscriber leaves,
+ *  the worker also prunes the feed + its articles from the shared pool
+ *  (pruned: true). */
+export async function deleteFeed(feedId: number): Promise<DeleteResult> {
+  return request<DeleteResult>(`/api/feeds/${feedId}`, {
     method: "DELETE",
   });
 }
