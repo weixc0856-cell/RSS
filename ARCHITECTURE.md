@@ -62,6 +62,8 @@ rss-worker (rss-worker.weixc0856.workers.dev)  →  D1 rss-db-dev   （默认/�
   UI 中文章时间显示 `published_at`；系统状态显示 `last_success/next_fetch`。
 - **数据平面 = `feeds` + `articles`**（抓取器写、API 读、前端调）；`rss_sources` /
   `rss_articles` 是 dormant 用户源原型层（0 行属预期），前端从不调用 —— 不是数据丢失。
+  **方向定稿（2026-09-06）：feeds/articles 是唯一生产模型**。用户源原型层不再演进，
+  不迁移、不删除；删除/下线属独立决定，未明确授权不动 —— 当前保留以维持 API/schema 兼容。
 
 ### 3.1 `published_at` 排序契约（不变量，2026-09-03）
 
@@ -180,6 +182,35 @@ last_modified`。
   （1148→1148，remaining_noncanonical=0）；部署后手动抓取证明新插入行同为 canonical。见
   `PRODUCTION_BASELINE.md`「published_at 归一化」增补。
 
+- [x] **共用硬伤收口 + 方向定稿（2026-09-06）**：四条与方向无关的硬伤修复落地，并正式
+  定稿「feeds 即产品」（§3）。顺序 WS1→WS4→WS2→WS3，各自独立 commit，均在 Gate 1
+  native 73 tests / wasm `cargo check --tests` / 前端 build+typecheck 通过后提交。
+  - **WS1** `320fb17`：`DELETE /api/feeds/:id` 真实现为**全局删除**（显式
+    subscriptions → articles → feeds 三删，404 `Feed not found`），**不是**取消订阅语义；
+    三个 dead `subscriptions` stub 改诚实 501（`success:false`，不写任何 D1）；
+    `delete_source` 加属主检查（无主 → 404 `Source not found`）。
+  - **WS4** `43ffd50`：diagnostics 纯增量纳入 `rss_sources`/`rss_articles` 计数
+    （生产 0/0，仅叠加，既有字段不动）。
+  - **WS2** `5700201`：feed/source 创建即 best-effort 入队首抓（payload 取自入库行，
+    非请求串再推导）；入队失败 `console_error` 带 id；**重复入队可接受**（文章持久化幂等，
+    outbound 不去重），`next_fetch_at=now` 保证 cron 兜底。
+  - **WS3** `b0ade57`：两管线共用**硬化 outbound fetch**（transport hardening，非 fetch
+    policy rewrite）—— 单跳 20s 响应超时（deadline，非硬取消；worker-rs 0.8.5 无 signal，
+    wasm 侧 `Delay` 竞速、非 wasm 直通）、2 MiB 体积上限（**post-buffering validation**，
+    非预流式内存上限）、词法 SSRF 守卫 `utils::is_safe_fetch_url`（**lexical guard，非完整
+    SSRF 防护**：DNS rebinding 不在覆盖内；redirect 每一跳复查 —— 真正风险是
+    `https://trusted → 302 http://127.0.0.1`）、redirect 上限 5（无 Location 的 3xx 视为
+    终态非 2xx，不进 body）；`FetchedFeed.body` 仅 2xx 有值（304 恒空 body 不解析）。
+  - 维护 `d675239`：`cf-api.mjs` D1 认证修复 —— scoped `CLOUDFLARE_API_TOKEN` 走 REST；
+    仅 OAuth 时无参查询改走本地 `wrangler d1 execute`（REST 拒收 OAuth token），带参查询
+    明确报错；`check-articles-contract.mjs` 去掉过时 `feeds==3` 硬基线，改跨端一致性 +
+    遍历全部 feed（详见脚本头）。
+  - **Gate 2 验收**：生产 legacy diagnostics **逐字段不变**（含 `last_fetch_run.id` 同 run）、
+    `POST /api/feeds/2/fetch` 回归 200、全 feed 文章窗口 canonical + DESC；D1 标量
+    nulls/noncanon/dups 均 0。dev 冒烟（创建即首抓、全局删除、重复删除 404、501、sources
+    属主隔离 404、diagnostics 新增字段）全绿。
+  - 部署：生产 `rss-worker-production` v`55782b68`、dev `rss-worker` v`e11df86b`。
+
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 
 `migrations/006_default_feeds.sql` 幂等地种入当前 3 个健康源（NYT World / BBC News /
@@ -193,7 +224,10 @@ OpenAI News，`fetch_interval_minutes=15`、`enabled=1`、`next_fetch_at=NULL`�
 
 ## 8. 待办 / 后续
 
-- [ ] 为 `rss_sources`（用户级源）补同一套健康字段并接入 UI 管理。
+- [ ] （方向已定为 feeds 即产品，2026-09-06）`rss_sources` / `rss_articles` 冻结层
+      **最终去向待单独授权**：当前不迁移不删除；可选后续为「归档下线（含 /api/sources
+      表面去留、TESTING.md 用户源用例去留）」或「只读保留」，属破坏性/产品表面决定，
+      不在未授权时执行。
 - [ ] 数据迁移脚本参数化 DB id 后入库（当前读 `.env`）。
 - [ ] 模块拆分（api/fetcher/parser/persistence）为可选重构，不阻塞业务。
 - [ ] CI：worker deploy + pages deploy workflow 固化（当前仅 rust.yml）。
