@@ -3,20 +3,25 @@ use serde_json::Value;
 use crate::types::*;
 use crate::db;
 
+/// Feed columns shared by the global pool catalog (`list_feeds`) and the
+/// per-device list (`handle_get_my_feeds`). The frontend derives each nav
+/// feed's health from exactly these fields, so BOTH endpoints MUST return the
+/// same projection — drift silently degrades the health badges. `/api/feeds`
+/// stays the shared-pool catalog (Discover-only for the frontend);
+/// `/api/me/feeds` is the only source the nav may read.
+const FEED_PROJECTION: &str = "id, url, title, site_url, favicon_url, last_fetched_at, status, \
+     error_message, enabled, fetch_interval_minutes, \
+     last_success_at, last_failure_at, last_http_status, \
+     consecutive_failures, next_fetch_at, \
+     normalized_url, created_at, updated_at";
+
 pub async fn health() -> Result<Response> {
     Response::ok("ok")
 }
 
 pub async fn list_feeds(env: Env) -> Result<Response> {
     let db = db::get_db(&env)?;
-    let stmt = db.prepare(
-        "SELECT id, url, title, site_url, favicon_url, last_fetched_at, status,
-                error_message, enabled, fetch_interval_minutes,
-                last_success_at, last_failure_at, last_http_status,
-                consecutive_failures, next_fetch_at,
-                normalized_url, created_at, updated_at
-         FROM feeds ORDER BY id DESC",
-    );
+    let stmt = db.prepare(&format!("SELECT {FEED_PROJECTION} FROM feeds ORDER BY id DESC"));
     let rows = stmt.all().await?;
     let feeds = rows.results::<Value>()?;
 
@@ -27,7 +32,59 @@ pub async fn list_feeds(env: Env) -> Result<Response> {
     })
 }
 
+/// Resolve the caller's device profile id. The error carries a 400-worthy
+/// message ("X-User-Id header required"); handlers map it to a structured
+/// `json_error` body. `X-User-Id` is a device *namespace* identifier, not
+/// authentication (see crate::identity).
+async fn require_device(req: &Request, env: &Env) -> std::result::Result<i32, String> {
+    crate::identity::require_profile(req, env)
+        .await
+        .map_err(|_| "X-User-Id header required".to_string())
+}
+
+/// One feed row in the canonical projection (used in create/subscribe responses
+/// so the returned feed is always the same shape `list_feeds` / the nav expect).
+async fn select_feed_row(db: &worker::D1Database, feed_id: i32) -> Result<Option<Value>> {
+    let stmt = db.prepare(&format!("SELECT {FEED_PROJECTION} FROM feeds WHERE id = ?1"));
+    Ok(stmt.bind(&[feed_id.into()])?.first::<Value>(None).await?)
+}
+
+/// Subscribe a device to a feed, idempotently. `UNIQUE(user_id, feed_id)` makes
+/// a repeated subscribe a no-op.
+async fn insert_subscription(db: &worker::D1Database, profile_id: i32, feed_id: i32) -> Result<()> {
+    db.prepare("INSERT OR IGNORE INTO subscriptions (user_id, feed_id) VALUES (?1, ?2)")
+        .bind(&[profile_id.into(), feed_id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Is this device already subscribed to the feed?
+async fn is_subscribed(db: &worker::D1Database, profile_id: i32, feed_id: i32) -> Result<bool> {
+    let row = db
+        .prepare("SELECT 1 FROM subscriptions WHERE user_id = ?1 AND feed_id = ?2")
+        .bind(&[profile_id.into(), feed_id.into()])?
+        .first::<Value>(None)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Find-or-create a shared-pool feed for this URL and subscribe THIS device to
+/// it. Fully idempotent and always `success:true` for a valid body:
+///   - pool has no such feed        -> create feed + subscribe + enqueue first fetch
+///   - pool has it, I am not subbed  -> subscribe silently
+///   - pool has it, I am subbed      -> no-op
+/// data = { feed: <full projection row>, created: bool, already: bool } —
+/// `created` = brand-new in the shared pool, `already` = this device was already
+/// subscribed before this call (drives honest frontend copy).
 pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
+    // Device identity FIRST — the header must be read before `req.json()` takes
+    // the body.
+    let profile_id = match require_device(&req, &env).await {
+        Ok(id) => id,
+        Err(message) => return json_error(&message, 400),
+    };
+
     let payload = match req.json::<serde_json::Value>().await {
         Ok(p) => p,
         Err(e) => {
@@ -53,83 +110,85 @@ pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
 
     let db = db::get_db(&env)?;
 
-    // Registry identity: reject duplicates by canonical URL (unique index backs this).
+    // Registry identity on the shared pool is the canonical URL (unique index backs it).
     let existing = db
         .prepare("SELECT id FROM feeds WHERE normalized_url = ?1")
         .bind(&[canonical.clone().into()])?
         .first::<Value>(None)
         .await?;
-    if existing.is_some() {
-        return Response::from_json(&ApiResponse::<()> {
-            success: false,
-            data: None,
-            error: Some("feed already exists".to_string()),
-        });
-    }
 
-    // New feed is due immediately (last_fetched_at IS NULL already covers this,
-    // but an explicit next_fetch_at keeps the scheduler query self-describing).
-    let interval = payload["fetch_interval_minutes"]
-        .as_i64()
-        .unwrap_or(15)
-        .clamp(5, 1440);
-    let stmt = db.prepare(
-        "INSERT INTO feeds (url, title, status, normalized_url, fetch_interval_minutes, next_fetch_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) RETURNING *",
-    );
+    let (feed_row, created, already) = if let Some(row) = existing {
+        let feed_id = row["id"]
+            .as_i64()
+            .ok_or_else(|| worker::Error::RustError("existing feed row missing id".to_string()))?
+            as i32;
+        let already = is_subscribed(&db, profile_id, feed_id).await?;
+        if !already {
+            insert_subscription(&db, profile_id, feed_id).await?;
+        }
+        let feed_row = select_feed_row(&db, feed_id)
+            .await?
+            .ok_or_else(|| worker::Error::RustError("subscribed feed row missing".to_string()))?;
+        (feed_row, false, already)
+    } else {
+        // Brand-new pool feed. Subscribe THIS device BEFORE the initial-fetch
+        // enqueue so the consumer's execution gate (feed must still have >=1
+        // subscriber) passes when the queued job runs.
+        let interval = payload["fetch_interval_minutes"]
+            .as_i64()
+            .unwrap_or(15)
+            .clamp(5, 1440);
+        let stmt = db.prepare(
+            "INSERT INTO feeds (url, title, status, normalized_url, fetch_interval_minutes, next_fetch_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) RETURNING id",
+        );
+        let args = vec![
+            worker::d1::D1Type::Text(url),
+            worker::d1::D1Type::Text(title),
+            worker::d1::D1Type::Text("pending"),
+            worker::d1::D1Type::Text(canonical.as_str()),
+            worker::d1::D1Type::Integer(interval as i32),
+        ];
+        let created_row = stmt
+            .bind_refs(args.iter())?
+            .first::<Value>(None)
+            .await?
+            .ok_or_else(|| worker::Error::RustError("feed insert returned no row".to_string()))?;
+        let feed_id = created_row["id"]
+            .as_i64()
+            .ok_or_else(|| worker::Error::RustError("feed insert missing id".to_string()))? as i32;
+        insert_subscription(&db, profile_id, feed_id).await?;
 
-    let args = vec![
-        worker::d1::D1Type::Text(url),
-        worker::d1::D1Type::Text(title),
-        worker::d1::D1Type::Text("pending"),
-        worker::d1::D1Type::Text(canonical.as_str()),
-        worker::d1::D1Type::Integer(interval as i32),
-    ];
-
-    match stmt.bind_refs(args.iter()) {
-        Ok(bound_stmt) => match bound_stmt.first::<Value>(None).await {
-            Ok(result) => {
-                // Best-effort initial fetch: enqueue immediately so the first
-                // articles arrive without waiting for the cron pass. The
-                // payload URL is read from the stored RETURNING row (==
-                // feeds.url), not re-derived from the request, so the queue
-                // always fetches what the table holds.
-                if let Some(row) = result.as_ref() {
-                    if let (Some(feed_id), Some(feed_url)) = (
-                        row.get("id").and_then(serde_json::Value::as_i64),
-                        row.get("url").and_then(serde_json::Value::as_str),
-                    ) {
-                        crate::queue::enqueue_initial_fetch(
-                            &env,
-                            serde_json::json!({
-                                "version": 1,
-                                "type": "feed_fetch",
-                                "feed_id": feed_id,
-                                "url": feed_url,
-                            }),
-                            "feed",
-                        )
-                        .await;
-                    }
-                }
-                Response::from_json(&ApiResponse {
-                    success: true,
-                    data: result,
-                    error: None,
-                })
-            }
-            Err(e) => Response::from_json(&ApiResponse::<()> {
-                success: false,
-                data: None,
-                error: Some(format!("Failed to insert feed: {}", e)),
+        // Best-effort initial fetch (mirrors pre-WS7 behavior): enqueue so the
+        // first articles arrive without waiting for the cron pass. Never fails
+        // the create — on any error the scheduler remains the fallback.
+        crate::queue::enqueue_initial_fetch(
+            &env,
+            serde_json::json!({
+                "version": 1,
+                "type": "feed_fetch",
+                "feed_id": feed_id,
+                "url": url,
             }),
-        },
-        Err(e) => Response::from_json(&ApiResponse::<()> {
-            success: false,
-            data: None,
-            error: Some(format!("Failed to prepare statement: {}", e)),
-        }),
-    }
+            "feed",
+        )
+        .await;
+
+        let feed_row = select_feed_row(&db, feed_id)
+            .await?
+            .ok_or_else(|| worker::Error::RustError("created feed row missing".to_string()))?;
+        (feed_row, true, false)
+    };
+
+    Response::from_json(&ApiResponse {
+        success: true,
+        data: Some(serde_json::json!({
+            "feed": feed_row,
+            "created": created,
+            "already": already,
+        })),
+        error: None,
+    })
 }
 
 pub async fn handle_get_feeds(env: Env) -> Result<Response> {
@@ -138,6 +197,55 @@ pub async fn handle_get_feeds(env: Env) -> Result<Response> {
 
 pub async fn handle_create_feed(req: Request, env: Env) -> Result<Response> {
     add_feed(req, env).await
+}
+
+/// THIS device's feed list (navigation-only). The frontend nav MUST derive from
+/// this endpoint, never from `GET /api/feeds` (which is the shared-pool
+/// catalog, Discover-only). Same projection as `list_feeds` so per-feed health
+/// renders identically, plus `subscribed_at` and the feed's article count.
+pub async fn handle_get_my_feeds(req: Request, env: Env) -> Result<Response> {
+    let profile_id = match require_device(&req, &env).await {
+        Ok(id) => id,
+        Err(message) => return json_error(&message, 400),
+    };
+    let db = db::get_db(&env)?;
+    let stmt = db.prepare(&format!(
+        "SELECT {FEED_PROJECTION},
+                s.subscribed_at,
+                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) AS article_count
+         FROM feeds f JOIN subscriptions s ON s.feed_id = f.id
+         WHERE s.user_id = ?1 ORDER BY f.id DESC"
+    ));
+    let rows = stmt.bind(&[profile_id.into()])?.all().await?;
+    let feeds = rows.results::<Value>()?;
+    Response::from_json(&ApiResponse {
+        success: true,
+        data: Some(feeds),
+        error: None,
+    })
+}
+
+/// Subscribe THIS device to an existing shared-pool feed (Discover "+"),
+/// idempotent. 404 when the feed id is no longer in the pool (it may have been
+/// pruned since the Discover strip rendered).
+pub async fn handle_subscribe_device(feed_id: i32, req: Request, env: Env) -> Result<Response> {
+    let profile_id = match require_device(&req, &env).await {
+        Ok(id) => id,
+        Err(message) => return json_error(&message, 400),
+    };
+    let db = db::get_db(&env)?;
+
+    let feed_row = match select_feed_row(&db, feed_id).await? {
+        Some(row) => row,
+        None => return json_error("Feed not found", 404),
+    };
+    insert_subscription(&db, profile_id, feed_id).await?;
+
+    Response::from_json(&ApiResponse {
+        success: true,
+        data: Some(feed_row),
+        error: None,
+    })
 }
 
 pub async fn handle_get_articles(feed_id: i32, env: Env) -> Result<Response> {
@@ -381,17 +489,6 @@ pub async fn handle_health(env: Env) -> Result<Response> {
     })
 }
 
-pub async fn handle_get_user_feeds(_user_id: i32) -> Result<Response> {
-    json_error("Not implemented", 501)
-}
-
-/// Dead API — the `subscriptions` table is not the product's data model. Kept
-/// reachable but honest: 501, and guaranteed to never write D1 (subscriptions/
-/// feeds/articles untouched). A dead API, not a half-usable one.
-pub async fn handle_subscribe_feed(_req: Request) -> Result<Response> {
-    json_error("Not implemented", 501)
-}
-
 /// JSON error body for business APIs that already speak the `ApiResponse`
 /// contract — only for turning prior `success:true` + error-text lies into an
 /// honest status. Plain HTTP errors (400/404/405…) keep `Response::error`.
@@ -404,45 +501,65 @@ fn json_error(message: &str, status: u16) -> Result<Response> {
     Ok(response.with_status(status))
 }
 
-/// Global feed deletion — NOT a per-user unsubscribe. It removes the shared
-/// feed, its articles and every subscription row. Explicit three-statement
-/// delete so the contract stays visible and independent of any implicit FK
-/// cascade behavior.
-pub async fn handle_delete_feed(feed_id: i32, env: Env) -> Result<Response> {
+/// THIS device unsubscribes from a shared-pool feed. When it was the last
+/// subscriber the pool entry is pruned too (feed + its articles) so an unowned
+/// feed is never left fetching. Explicit delete order (articles before feed)
+/// keeps the contract visible and independent of any implicit FK cascade.
+/// Returns `{ id, pruned }` so the caller can report whether the pool was hit.
+pub async fn handle_unsubscribe(feed_id: i32, req: Request, env: Env) -> Result<Response> {
+    let profile_id = match require_device(&req, &env).await {
+        Ok(id) => id,
+        Err(message) => return json_error(&message, 400),
+    };
     let db = db::get_db(&env)?;
 
+    // Feed must exist. A 404 also does not leak whether OTHER devices subscribe.
     let existing = db
         .prepare("SELECT id FROM feeds WHERE id = ?1")
         .bind(&[feed_id.into()])?
         .first::<Value>(None)
         .await?;
     if existing.is_none() {
-        return Response::error("Feed not found", 404);
+        return json_error("Feed not found", 404);
     }
 
-    db.prepare("DELETE FROM subscriptions WHERE feed_id = ?1")
-        .bind(&[feed_id.into()])?
+    // This device must be subscribed — refusing when it is not keeps pool
+    // membership of other devices private.
+    if !is_subscribed(&db, profile_id, feed_id).await? {
+        return json_error("Not subscribed to this feed", 404);
+    }
+
+    // Remove this device's subscription, then decide whether the pool entry is
+    // now unowned (last subscriber → prune).
+    db.prepare("DELETE FROM subscriptions WHERE user_id = ?1 AND feed_id = ?2")
+        .bind(&[profile_id.into(), feed_id.into()])?
         .run()
         .await?;
-    db.prepare("DELETE FROM articles WHERE feed_id = ?1")
+
+    let remaining = db
+        .prepare("SELECT COUNT(*) AS c FROM subscriptions WHERE feed_id = ?1")
         .bind(&[feed_id.into()])?
-        .run()
+        .first::<Value>(None)
         .await?;
-    db.prepare("DELETE FROM feeds WHERE id = ?1")
-        .bind(&[feed_id.into()])?
-        .run()
-        .await?;
+    let left = remaining.and_then(|r| r["c"].as_i64()).unwrap_or(0);
+    let mut pruned = false;
+    if left == 0 {
+        db.prepare("DELETE FROM articles WHERE feed_id = ?1")
+            .bind(&[feed_id.into()])?
+            .run()
+            .await?;
+        db.prepare("DELETE FROM feeds WHERE id = ?1")
+            .bind(&[feed_id.into()])?
+            .run()
+            .await?;
+        pruned = true;
+    }
 
     Response::from_json(&ApiResponse {
         success: true,
-        data: Some(serde_json::json!({ "id": feed_id })),
+        data: Some(serde_json::json!({ "id": feed_id, "pruned": pruned })),
         error: None,
     })
-}
-
-/// Dead API — same as subscribe: honest 501, no D1 side effects.
-pub async fn handle_unsubscribe_feed(_user_id: i32, _feed_id: i32) -> Result<Response> {
-    json_error("Not implemented", 501)
 }
 
 /// Retired API — the user-scoped `/api/sources` prototype layer is dormant (see

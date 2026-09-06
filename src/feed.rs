@@ -247,13 +247,15 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
     let db = env.d1("rss_db")?;
     let row = db
         .prepare(
-            "SELECT id, url, fetch_interval_minutes, consecutive_failures, etag, last_modified
-             FROM feeds WHERE url = ?1",
+            "SELECT f.id, f.url, f.fetch_interval_minutes, f.consecutive_failures, f.etag, f.last_modified
+             FROM feeds f
+             WHERE f.url = ?1
+               AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.feed_id = f.id)",
         )
         .bind(&[url.into()])?
         .first::<serde_json::Value>(None)
         .await?
-        .ok_or_else(|| Error::RustError("feed not found".to_string()))?;
+        .ok_or_else(|| Error::RustError("feed not found or has no subscribers".to_string()))?;
 
     let feed_id = row["id"].as_i64().unwrap_or(0) as i32;
     if feed_id <= 0 {
@@ -335,6 +337,24 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
             return Err(error);
         }
     };
+
+    // Execution gate, re-check: the fetch above spent seconds outbound, during
+    // which the last subscriber may have unsubscribed and pruned this feed +
+    // its articles. Skip persisting entirely (Ok(0), no mark_success/failure on
+    // the now-deleted feed row) rather than resurrect orphan articles.
+    let still_subscribed = db
+        .prepare("SELECT 1 FROM subscriptions WHERE feed_id = ?1 LIMIT 1")
+        .bind(&[feed_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .is_some();
+    if !still_subscribed {
+        console_log!(
+            "[feed] skip persist feed_id={}: no subscribers remain",
+            feed_id
+        );
+        return Ok(0);
+    }
 
     for article in articles.into_iter().take(MAX_ARTICLES_PER_FETCH) {
         let args = [

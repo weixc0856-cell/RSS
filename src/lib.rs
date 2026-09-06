@@ -2,6 +2,7 @@ mod types;
 mod routes;
 mod db;
 mod feed;
+mod identity;
 mod queue;
 mod scheduler;
 mod utils;
@@ -68,9 +69,11 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Feed management
         (Method::Get, "/api/feeds") => handle_get_feeds(env).await,
         (Method::Post, "/api/feeds") => handle_create_feed(req, env).await,
+        // Unsubscribe THIS device from a pool feed. When the last subscriber
+        // leaves, the feed + its articles are pruned from the shared pool.
         (Method::Delete, path) if path.starts_with("/api/feeds/") && !path.ends_with("/articles") && !path.ends_with("/subscribe") && !path.ends_with("/fetch") => {
             if let Ok(feed_id) = path.strip_prefix("/api/feeds/").unwrap_or("").parse::<i32>() {
-                handle_delete_feed(feed_id, env).await
+                handle_unsubscribe(feed_id, req, env).await
             } else {
                 Response::error("Invalid feed ID", 400)
             }
@@ -102,31 +105,22 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         }
 
-        // User subscriptions
-        (Method::Get, path) if path.starts_with("/api/users/") && path.ends_with("/feeds") => {
-            let user_id_str = path
-                .strip_prefix("/api/users/")
-                .and_then(|s| s.strip_suffix("/feeds"))
-                .unwrap_or("");
-            if let Ok(user_id) = user_id_str.parse::<i32>() {
-                handle_get_user_feeds(user_id).await
-            } else {
-                Response::error("Invalid user ID", 400)
-            }
-        }
+        // Per-device subscription surface (device namespace = X-User-Id header,
+        // NOT authentication — see src/identity.rs). This device's list is the
+        // only source the frontend nav may read (/api/feeds stays the shared
+        // pool catalog, Discover-only).
+        (Method::Get, "/api/me/feeds") => handle_get_my_feeds(req, env).await,
 
-        (Method::Post, "/api/subscriptions") => handle_subscribe_feed(req).await,
-        
-        (Method::Delete, path) if path.starts_with("/api/users/") && path.contains("/subscriptions/") => {
-            let parts: Vec<&str> = path.split("/").collect();
-            if parts.len() >= 5 {
-                if let (Ok(user_id), Ok(feed_id)) = (parts[3].parse::<i32>(), parts[5].parse::<i32>()) {
-                    handle_unsubscribe_feed(user_id, feed_id).await
-                } else {
-                    Response::error("Invalid IDs", 400)
-                }
+        // Subscribe THIS device to an existing shared-pool feed (Discover "+").
+        (Method::Post, path) if path.starts_with("/api/feeds/") && path.ends_with("/subscribe") => {
+            let feed_id_str = path
+                .strip_prefix("/api/feeds/")
+                .and_then(|s| s.strip_suffix("/subscribe"))
+                .unwrap_or("");
+            if let Ok(feed_id) = feed_id_str.parse::<i32>() {
+                handle_subscribe_device(feed_id, req, env).await
             } else {
-                Response::error("Invalid path", 400)
+                Response::error("Invalid feed ID", 400)
             }
         }
 
@@ -177,7 +171,7 @@ fn apply_api_headers(response: &mut Response, origin: Option<&str>) -> Result<()
     }
     response
         .headers_mut()
-        .set("Access-Control-Allow-Headers", "Content-Type")?;
+        .set("Access-Control-Allow-Headers", "Content-Type, X-User-Id")?;
     response
         .headers_mut()
         .set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")?;

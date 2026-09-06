@@ -24,25 +24,11 @@ pub struct Article {
     pub hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Subscription {
-    pub id: i32,
-    pub user_id: i32,
-    pub feed_id: i32,
-    pub created_at: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct CreateFeedRequest {
     pub url: String,
     pub title: Option<String>,
     pub site_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SubscribeFeedRequest {
-    pub user_id: i32,
-    pub feed_id: i32,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -108,19 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn subscription_serializes_and_deserializes() {
-        let sub = Subscription {
-            id: 3,
-            user_id: 7,
-            feed_id: 1,
-            created_at: "2026-09-02T00:00:00Z".to_string(),
-        };
-        let json = serde_json::to_string(&sub).expect("serialize");
-        let back: Subscription = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(sub, back);
-    }
-
-    #[test]
     fn api_response_roundtrips_with_data() {
         let response: ApiResponse<Vec<Article>> = ApiResponse {
             success: true,
@@ -166,16 +139,6 @@ mod tests {
             serde_json::from_str(r#"{"url":"https://example.com/rss"}"#).expect("minimal request");
         assert_eq!(minimal.title, None);
         assert_eq!(minimal.site_url, None);
-    }
-
-    #[test]
-    fn subscribe_feed_request_deserializes() {
-        let req: SubscribeFeedRequest =
-            serde_json::from_str(r#"{"user_id":42,"feed_id":13}"#).expect("subscribe request");
-        assert_eq!(req.user_id, 42);
-        assert_eq!(req.feed_id, 13);
-
-        assert!(serde_json::from_str::<SubscribeFeedRequest>(r#"{"user_id":42}"#).is_err());
     }
 
     #[test]

@@ -73,13 +73,18 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
     };
 
     // ---- select due feeds (next_fetch_at based) -----------------------------
+    // Subscription gate: a feed is only scheduled when at least one device is
+    // subscribed. 0-subscription pool feeds are dormant — Discover-visible but
+    // not fetched (see ARCHITECTURE.md pool state machine). The consumer-side
+    // execution gate in fetch_feed re-checks this right before persisting.
     let stmt = db.prepare(
-        "SELECT id, url FROM feeds
-         WHERE enabled = 1
-           AND (last_fetched_at IS NULL
-                OR next_fetch_at IS NULL
-                OR next_fetch_at <= datetime('now'))
-         ORDER BY id",
+        "SELECT f.id, f.url FROM feeds f
+         WHERE f.enabled = 1
+           AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.feed_id = f.id)
+           AND (f.last_fetched_at IS NULL
+                OR f.next_fetch_at IS NULL
+                OR f.next_fetch_at <= datetime('now'))
+         ORDER BY f.id",
     );
     let rows = stmt.all().await?;
     let feeds = rows.results::<Value>()?;
