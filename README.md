@@ -39,7 +39,7 @@ Cloudflare RSS 聚合器，两件套：
 ├─ frontend/                 # Astro 站（rss-intelligence）
 │  └─ src/{pages,components,lib,scripts,styles}
 ├─ wrangler.toml             # worker 配置（由 scripts/render-config.ps1 从 template 渲染）
-├─ ARCHITECTURE.md / SETUP.md / TESTING.md / PRODUCTION_BASELINE.md
+├─ ARCHITECTURE.md / SETUP.md / TESTING.md / PRODUCTION_BASELINE.md / LICENSE
 ```
 
 ## Worker API
@@ -81,9 +81,13 @@ README 不重复。测试矩阵（单测 / functional / drills / perf / 契约 /
 [TESTING.md](TESTING.md)。一句话：
 
 ```bash
-cargo test --all                       # 73 native 单测
+cargo test --all                       # 72 native 单测
 pwsh scripts/test-functional.ps1       # 只读 functional（dev/prod URL）
 node scripts/ws7-device-drill.mjs      # 设备隔离演练（dev-only，refuse prod）
 node scripts/check-articles-contract.mjs  # 生产只读契约（feeds==D1、published_at canonical、<48h）
 cd frontend && npm run build           # Astro 构建 → wrangler pages deploy dist
 ```
+
+## 许可证
+
+[MIT](LICENSE) © 2026 weixc0856。

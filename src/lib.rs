@@ -164,10 +164,10 @@ fn apply_api_headers(response: &mut Response, origin: Option<&str>) -> Result<()
     // ACAO is chosen from the request Origin, so any cache that stores this
     // response must key on Origin too.
     response.headers_mut().set("Vary", "Origin")?;
-    if let Some(origin) = origin {
-        if is_allowed_origin(origin) {
-            response.headers_mut().set("Access-Control-Allow-Origin", origin)?;
-        }
+    if let Some(origin) = origin
+        && is_allowed_origin(origin)
+    {
+        response.headers_mut().set("Access-Control-Allow-Origin", origin)?;
     }
     response
         .headers_mut()

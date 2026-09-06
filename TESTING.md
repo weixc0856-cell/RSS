@@ -14,8 +14,10 @@ Run: `cargo test --all`
 | `queue.rs` | FetchJob serde/parse/reject-malformed; `route_job`: v1 version/type
   contract, unknown-version/type rejection, retired `source_fetch` rejection |
 
-Expected: `73 passed` (run `cargo test --all`; WS7: −2 removed Subscription /
-SubscribeFeedRequest serde tests, +4 identity tests).
+Expected: `72 passed` (run `cargo test --all`; WS7: −2 removed Subscription /
+SubscribeFeedRequest serde tests, +4 identity tests; WS7.2 release cleanup:
+−1 removed the dead `CreateFeedRequest` DTO + its orphan serde test — the create
+handler reads the body as `serde_json::Value`, so no handler ever deserialized it).
 
 ## 2. Integration + functional tests (live HTTP)
 Run: `pwsh scripts/test-functional.ps1 -Base https://rss-worker.weixc0856.workers.dev`

@@ -1,4 +1,4 @@
-use crate::types::{Article, Feed};
+use crate::types::Article;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use url::Url;
@@ -23,29 +23,28 @@ const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 /// cancellation of the underlying outbound request (see `race_timeout`).
 const FETCH_TIMEOUT_SECS: u64 = 20;
 
+/// Parser namespace. Production reaches the parse pipeline through the free
+/// `fetch_feed` → `parse_document` path; `generate_article_hash` is called from
+/// the `parse_document` write-choke point. `parse_rss` / `parse_atom` exist only
+/// so the unit suite can state *which format* a fixture exercises at the call
+/// site — both forward to the same tag-driven `parse_document` — so they are
+/// compiled only under `#[cfg(test)]`.
 pub struct FeedParser;
 
 impl FeedParser {
-    pub async fn fetch_feed(url: &str) -> Result<Vec<Article>> {
-        let parsed = Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?;
-        let fetched = fetch_feed_document(&parsed, &[]).await?;
-        if !(200..300).contains(&fetched.status) {
-            return Err(Error::RustError(format!("feed returned HTTP {}", fetched.status)));
-        }
-
-        parse_document(&fetched.body, 0)
+    /// Deterministic article de-dupe key over (title, link), stored as `hash`.
+    pub fn generate_article_hash(title: &str, link: &str) -> String {
+        format!("{:x}", md5::compute(format!("{}{}", title, link)))
     }
 
+    #[cfg(test)]
     pub fn parse_rss(content: &str, feed_id: i32) -> Result<Vec<Article>> {
         parse_document(content, feed_id)
     }
 
+    #[cfg(test)]
     pub fn parse_atom(content: &str, feed_id: i32) -> Result<Vec<Article>> {
         parse_document(content, feed_id)
-    }
-
-    pub fn generate_article_hash(title: &str, link: &str) -> String {
-        format!("{:x}", md5::compute(format!("{}{}", title, link)))
     }
 }
 
@@ -77,7 +76,7 @@ pub(crate) struct FetchedFeed {
 /// carries the conditional-GET validators and is re-sent on every hop — the
 /// same effect runtime "follow" mode had on them.
 async fn send_once(url: &Url, extra: &[(&str, &str)]) -> Result<worker::Response> {
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     headers.set(
         "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -167,14 +166,13 @@ pub(crate) async fn fetch_feed_document(
 
         // Content-Length pre-check (advisory — the authoritative cap is the
         // post-read `body.len()` check below).
-        if let Some(raw) = response_header(&response, "content-length") {
-            if let Ok(len) = raw.parse::<usize>() {
-                if len > MAX_FEED_BYTES {
-                    return Err(Error::RustError(format!(
-                        "feed response too large: Content-Length {len} exceeds {MAX_FEED_BYTES} bytes"
-                    )));
-                }
-            }
+        if let Some(raw) = response_header(&response, "content-length")
+            && let Ok(len) = raw.parse::<usize>()
+            && len > MAX_FEED_BYTES
+        {
+            return Err(Error::RustError(format!(
+                "feed response too large: Content-Length {len} exceeds {MAX_FEED_BYTES} bytes"
+            )));
         }
 
         if !(200..300).contains(&status) {
@@ -276,10 +274,10 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
         ("If-None-Match", etag.as_deref()),
         ("If-Modified-Since", last_modified.as_deref()),
     ] {
-        if let Some(value) = value {
-            if !value.is_empty() {
-                conditional.push((name, value));
-            }
+        if let Some(value) = value
+            && !value.is_empty()
+        {
+            conditional.push((name, value));
         }
     }
 
@@ -489,20 +487,18 @@ fn parse_document(content: &str, feed_id: i32) -> Result<Vec<Article>> {
                 let name = local_name(event_name.as_ref());
                 if name == "item" || name == "entry" {
                     current = Some(ParsedArticle::default());
-                } else if current.is_some() {
+                } else if let Some(article) = current.as_mut() {
                     field = name.to_string();
                     if name == "link" {
-                        if let Some(article) = current.as_mut() {
-                            article.link = attribute(&event, b"href");
-                        }
+                        article.link = attribute(&event, b"href");
                     }
                 }
             }
             Ok(Event::Empty(event)) => {
-                if current.is_some() && local_name(event.name().as_ref()) == "link" {
-                    if let Some(article) = current.as_mut() {
-                        article.link = attribute(&event, b"href");
-                    }
+                if let Some(article) = current.as_mut()
+                    && local_name(event.name().as_ref()) == "link"
+                {
+                    article.link = attribute(&event, b"href");
                 }
             }
             Ok(Event::Text(text)) => {

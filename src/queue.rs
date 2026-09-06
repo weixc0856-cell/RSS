@@ -16,7 +16,7 @@ pub struct FetchJob {
 /// retrying forever; the batch is always acked.
 #[event(queue)]
 pub async fn consume(
-    mut batch: MessageBatch<serde_json::Value>,
+    batch: MessageBatch<serde_json::Value>,
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
@@ -253,7 +253,10 @@ async fn record_run(
 /// reported back clean.
 ///
 /// This is the specification mirror of the SQL CASE in `record_run` — change one
-/// and change the other.
+/// and change the other. Production classifies in SQL inside `record_run`; this
+/// function exists to pin that state machine in unit tests, so it is compiled
+/// only under `#[cfg(test)]` and never shipped in the Worker binary.
+#[cfg(test)]
 fn classify_run(scheduled: i64, fetched: i64, failed: i64) -> Option<&'static str> {
     if scheduled <= 0 || fetched + failed < scheduled {
         return None;

@@ -21,7 +21,7 @@ pub async fn health() -> Result<Response> {
 
 pub async fn list_feeds(env: Env) -> Result<Response> {
     let db = db::get_db(&env)?;
-    let stmt = db.prepare(&format!("SELECT {FEED_PROJECTION} FROM feeds ORDER BY id DESC"));
+    let stmt = db.prepare(format!("SELECT {FEED_PROJECTION} FROM feeds ORDER BY id DESC"));
     let rows = stmt.all().await?;
     let feeds = rows.results::<Value>()?;
 
@@ -45,8 +45,8 @@ async fn require_device(req: &Request, env: &Env) -> std::result::Result<i32, St
 /// One feed row in the canonical projection (used in create/subscribe responses
 /// so the returned feed is always the same shape `list_feeds` / the nav expect).
 async fn select_feed_row(db: &worker::D1Database, feed_id: i32) -> Result<Option<Value>> {
-    let stmt = db.prepare(&format!("SELECT {FEED_PROJECTION} FROM feeds WHERE id = ?1"));
-    Ok(stmt.bind(&[feed_id.into()])?.first::<Value>(None).await?)
+    let stmt = db.prepare(format!("SELECT {FEED_PROJECTION} FROM feeds WHERE id = ?1"));
+    stmt.bind(&[feed_id.into()])?.first::<Value>(None).await
 }
 
 /// Subscribe a device to a feed, idempotently. `UNIQUE(user_id, feed_id)` makes
@@ -74,7 +74,8 @@ async fn is_subscribed(db: &worker::D1Database, profile_id: i32, feed_id: i32) -
 ///   - pool has no such feed        -> create feed + subscribe + enqueue first fetch
 ///   - pool has it, I am not subbed  -> subscribe silently
 ///   - pool has it, I am subbed      -> no-op
-/// data = { feed: <full projection row>, created: bool, already: bool } —
+///
+/// `data` = `{ feed, created, already }`: `feed` is the full projection row,
 /// `created` = brand-new in the shared pool, `already` = this device was already
 /// subscribed before this call (drives honest frontend copy).
 pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
@@ -142,7 +143,7 @@ pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
             "INSERT INTO feeds (url, title, status, normalized_url, fetch_interval_minutes, next_fetch_at)
              VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) RETURNING id",
         );
-        let args = vec![
+        let args = [
             worker::d1::D1Type::Text(url),
             worker::d1::D1Type::Text(title),
             worker::d1::D1Type::Text("pending"),
@@ -213,7 +214,7 @@ pub async fn handle_get_my_feeds(req: Request, env: Env) -> Result<Response> {
     // the projection's bare `id` / `created_at` would otherwise collide with
     // subscriptions' columns and D1 rejects it as "ambiguous column name".
     // `subscribed_at` / article_count arrive via correlated subqueries instead.
-    let stmt = db.prepare(&format!(
+    let stmt = db.prepare(format!(
         "SELECT {FEED_PROJECTION},
                 (SELECT s.subscribed_at FROM subscriptions s
                  WHERE s.feed_id = f.id AND s.user_id = ?1) AS subscribed_at,

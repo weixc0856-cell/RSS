@@ -22,7 +22,7 @@ pub fn canonical_url(raw: &str) -> String {
     let trimmed = raw.trim();
     match url::Url::parse(trimmed) {
         Ok(mut u) => {
-            let _ = u.set_fragment(None);
+            u.set_fragment(None);
             let scheme = u.scheme().to_lowercase();
             let host = u
                 .host_str()

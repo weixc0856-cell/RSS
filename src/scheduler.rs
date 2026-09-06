@@ -15,7 +15,18 @@ use crate::utils::sqlite_now;
 ///    (`run_key`), making the scheduler idempotent: re-fires inside the same
 ///    minute do not double-enqueue.
 #[event(scheduled)]
-pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    // worker-rs 0.8.5's `#[event(scheduled)]` glue calls the handler and drops
+    // its `Result` without logging (unlike the queue glue, which logs + panics
+    // on `Err`), so a `Result`-returning body would fail *silently*. The cron
+    // entry point therefore returns `()` and routes the work through
+    // `run_schedule`, logging any error here.
+    if let Err(error) = run_schedule(event, env, _ctx).await {
+        console_error!("[scheduler] run failed: {error:?}");
+    }
+}
+
+async fn run_schedule(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
     let cron = event.cron();
     console_log!("[scheduler] CRON FIRED cron={}", cron);
 
@@ -35,42 +46,42 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
            finished_at = COALESCE(finished_at, datetime('now'))
          WHERE status = 'running' AND run_key < ?1",
     )
-    .bind_refs(vec![worker::d1::D1Type::Text(run_key.as_str())].iter())?
+    .bind_refs([worker::d1::D1Type::Text(run_key.as_str())].iter())?
     .run()
     .await?;
 
     let existing = db
         .prepare("SELECT id FROM fetch_runs WHERE run_key = ?1")
-        .bind_refs(
-            vec![worker::d1::D1Type::Text(run_key.as_str())].iter(),
-        )?
+        .bind_refs([worker::d1::D1Type::Text(run_key.as_str())].iter())?
         .first::<Value>(None)
         .await?;
-    let run_id: i64 = if let Some(row) = existing {
-        // Already scheduled this minute — skip to avoid double enqueue.
+    // Already scheduled this minute — skip to avoid double enqueue. The row's
+    // content is irrelevant (idempotency is keyed on `run_key` presence).
+    if existing.is_some() {
         console_log!("[scheduler] run_key {} already processed, skipping", run_key);
         return Ok(());
-    } else {
-        let trigger = format!("cron:{cron}");
-        db.prepare(
-            "INSERT INTO fetch_runs (started_at, trigger, run_key, status) VALUES (datetime('now'), ?1, ?2, 'running')",
-        )
-        .bind_refs(
-            vec![
-                worker::d1::D1Type::Text(trigger.as_str()),
-                worker::d1::D1Type::Text(run_key.as_str()),
-            ]
-            .iter(),
-        )?
-        .run()
-        .await?;
-        db.prepare("SELECT id FROM fetch_runs WHERE run_key = ?1")
-            .bind_refs(vec![worker::d1::D1Type::Text(run_key.as_str())].iter())?
-            .first::<Value>(None)
-            .await?
-            .and_then(|row| row["id"].as_i64())
-            .ok_or_else(|| Error::RustError("fetch_run id missing".to_string()))?
-    };
+    }
+
+    let trigger = format!("cron:{cron}");
+    db.prepare(
+        "INSERT INTO fetch_runs (started_at, trigger, run_key, status) VALUES (datetime('now'), ?1, ?2, 'running')",
+    )
+    .bind_refs(
+        [
+            worker::d1::D1Type::Text(trigger.as_str()),
+            worker::d1::D1Type::Text(run_key.as_str()),
+        ]
+        .iter(),
+    )?
+    .run()
+    .await?;
+    let run_id: i64 = db
+        .prepare("SELECT id FROM fetch_runs WHERE run_key = ?1")
+        .bind_refs([worker::d1::D1Type::Text(run_key.as_str())].iter())?
+        .first::<Value>(None)
+        .await?
+        .and_then(|row| row["id"].as_i64())
+        .ok_or_else(|| Error::RustError("fetch_run id missing".to_string()))?;
 
     // ---- select due feeds (next_fetch_at based) -----------------------------
     // Subscription gate: a feed is only scheduled when at least one device is

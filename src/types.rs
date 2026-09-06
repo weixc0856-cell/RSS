@@ -24,13 +24,6 @@ pub struct Article {
     pub hash: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateFeedRequest {
-    pub url: String,
-    pub title: Option<String>,
-    pub site_url: Option<String>,
-}
-
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -123,22 +116,6 @@ mod tests {
         assert!(empty.success);
         assert_eq!(empty.data, None);
         assert_eq!(empty.error, None);
-    }
-
-    #[test]
-    fn create_feed_request_deserializes_with_optional_fields() {
-        // Both JSON shapes accepted by handlers must deserialize.
-        let full: CreateFeedRequest =
-            serde_json::from_str(r#"{"url":"https://example.com/rss","title":"T","site_url":"https://example.com"}"#)
-                .expect("full request");
-        assert_eq!(full.url, "https://example.com/rss");
-        assert_eq!(full.title.as_deref(), Some("T"));
-        assert_eq!(full.site_url.as_deref(), Some("https://example.com"));
-
-        let minimal: CreateFeedRequest =
-            serde_json::from_str(r#"{"url":"https://example.com/rss"}"#).expect("minimal request");
-        assert_eq!(minimal.title, None);
-        assert_eq!(minimal.site_url, None);
     }
 
     #[test]

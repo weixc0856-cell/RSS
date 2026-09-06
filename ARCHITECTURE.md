@@ -368,6 +368,20 @@ last_modified`。
     首见 Recommended 19 全 +、池尾段仅露「非目录且未订」的池源。遗留外观项（pre-existing，
     非 WS7.1 引入）见 §8。
 
+- [x] **WS7.2 Release Cleanup（2026-09-06）**：公开前**只清障、不重构**（评审结论：
+  停在这里，不塞 AI，不做架构大修）。crate 名 `RSS` → `rss`（消 `non_snake_case`）；
+  `cargo clippy --all-targets --all-features -- -D warnings` 从 28 → **0**。dead code 按
+  「真死删除 / 测试专用 `cfg(test)`」分类：删 `FeedParser::fetch_feed`（生产走自由函数
+  `fetch_feed`，此 assoc fn 连测试也无引用）、删 `types::CreateFeedRequest`（create
+  handler 以 `serde_json::Value` 读 body，DTO 无任何引用 —— native 测试数 73→72）；
+  `FeedParser::parse_rss/parse_atom`（测试按格式声明意图的命名入口，同一 `parse_document`）
+  与 `queue::classify_run`（SQL 分类 CASE 的测试态规格镜像）改 `#[cfg(test)]`，不随 Worker
+  发布。scheduler `#[event(scheduled)]` 的 `Result` 在 worker-rs 0.8.5 宏里被**静默丢弃**
+  （`unused_must_use`，错误无感知）—— handler 改返回 `()`，body 挪进 `run_schedule` +
+  `console_error` 记日志，顺带修掉该洞。Gate：native 72 tests / 0 warning、clippy
+  `-D warnings` 0、wasm `cargo check`(+`--tests`) 干净、前端 typecheck+build 通过（本记录
+  所在 commit）。
+
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 
 `migrations/006_default_feeds.sql` 幂等地种入当前 3 个健康源（NYT World / BBC News /
