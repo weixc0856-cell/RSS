@@ -1,211 +1,89 @@
-# 🔗 RSS Worker
+# RSS Intelligence
 
-A powerful Cloudflare Workers RSS feed aggregator and parser built with Rust, Wrangler, and Workers D1 database.
+Cloudflare RSS 聚合器，两件套：
 
-## Features
+- **Worker**（Rust → wasm32，worker-rs）：抓取 / 解析 / 持久化 / 调度。
+- **Frontend**（Astro 静态站，生产在 rss-intelligence.pages.dev）：Worker API 的唯一客户端。
 
-- 📡 **Feed Management** — Add, update, and remove RSS/Atom feeds
-- 🔍 **Feed Parsing** — Support for RSS 2.0 and Atom feed formats
-- 💾 **Database Storage** — Persistent storage with Cloudflare D1
-- ⚡ **Caching** — KV store for performance optimization
-- 🏥 **Health Checks** — Built-in health endpoint
-- 🔐 **Secure** — Runs on Cloudflare's edge network
-- 📊 **Scalable** — Auto-scaling without infrastructure management
+数据模型与设计决策见 [ARCHITECTURE.md](ARCHITECTURE.md)；环境 / 配置 / 部署见
+[SETUP.md](SETUP.md)；测试矩阵见 [TESTING.md](TESTING.md)；生产只读验收基线见
+[PRODUCTION_BASELINE.md](PRODUCTION_BASELINE.md)。
 
-## Project Structure
+## 概念（feeds 即产品）
+
+- **共享池 + 设备订阅**：`feeds` / `articles` 是**一份共享池**（Discover 的数据面）。
+  `subscriptions (device_id, feed_id)` 把**每台设备各自的列表**挂到池上；`profiles` 把匿名
+  设备 key（`X-User-Id` 头，浏览器 `localStorage` 的 UUID）映射为 INTEGER id。
+  **0 订阅 = dormant**，调度器不抓；最后订阅者退订才把 feed + articles 一并 prune。
+- **设备模型（WS7）**：新设备从**空列表**起步，靠 Discover 订阅建议或贴 URL 回源。
+  `X-User-Id` 是设备命名空间 id —— **非鉴权、非账户**（碰撞极低但可伪造，不做安全边界）。
+- **Discover（WS7.1）** = **Recommended 目录**（静态精选 19 源，GREEN-only，配置在
+  `frontend/src/lib/recommended-feeds.ts`）+ **Shared Pool 尾段**（池里其余可订源）。
+  两段独立渲染、**绝不合并**——目录是系统精选，尾段只是共享残留。
+- **canonical `published_at`**：每行存储的 `published_at` 是固定 20 字符
+  `YYYY-MM-DDTHH:MM:SSZ`，字符串排序 ≡ 时间排序。
+
+## 目录结构
 
 ```
-D:\Project\RSS\
-├─ Cargo.toml              # Rust dependencies and config
-├─ wrangler.toml           # Cloudflare Workers configuration
-├─ package.json            # NPM configuration
-├─ README.md               # This file
-├─ migrations/
-│  └─ 001_init.sql         # Database initialization
-├─ src/
-│  ├─ lib.rs               # Main worker entry point (fetch router)
-│  ├─ types.rs             # Data models and types
-│  ├─ routes.rs            # API route handlers (incl. GET /api/diagnostics)
-│  ├─ db.rs                # D1 access
-│  ├─ feed.rs              # RSS/Atom feed parsing & fetch/persist pipeline
-│  ├─ queue.rs             # Queue consumer (fetch jobs produced by scheduler)
-│  └─ scheduler.rs         # Cron trigger: enqueues due feeds (hourly)
-├─ public/
-│  └─ index.html           # Landing page with API docs
-└─ build/
-   └─ worker/
-      └─ shim.mjs          # Worker entry point
+├─ src/                      # Rust worker（wasm32）
+│  ├─ lib.rs                 # 入口 + 路由 + CORS（X-User-Id 重宣告）
+│  ├─ routes.rs / db.rs      # API handler / D1 访问
+│  ├─ feed.rs                # RSS/Atom 解析 + 抓取持久化管线（canonical published_at 收口）
+│  ├─ identity.rs            # 设备 key 规范化 + profiles 查/插
+│  ├─ queue.rs / scheduler.rs# cron 到期入队 → 队列消费抓取
+│  ├─ types.rs / utils.rs    # serde 模型 / 时间 URL 工具
+├─ migrations/               # 001–007 D1 schema（见下）
+├─ scripts/                  # 维护/验证/演练：harness、drill、契约、回填、render-config
+├─ public/index.html         # 静态 landing + API 速查（部署到 Pages）
+├─ frontend/                 # Astro 站（rss-intelligence）
+│  └─ src/{pages,components,lib,scripts,styles}
+├─ wrangler.toml             # worker 配置（由 scripts/render-config.ps1 从 template 渲染）
+├─ ARCHITECTURE.md / SETUP.md / TESTING.md / PRODUCTION_BASELINE.md
 ```
 
-## API Endpoints
+## Worker API
 
-### Health Check
-- `GET /health` — Returns `ok` if the service is running
+动态端点一律回 `Cache-Control: no-store` 并允许 `X-User-Id` 预检；带 `X-User-Id` 的端点在
+匿名时答结构化 400 / 404。
 
-### Feed Management
-- `GET /api/feeds` — Get all subscribed feeds
-- `POST /api/feeds` — Create a new feed
-  - Request body: `{ "url": "https://...", "title": "..." }`
-- `GET /api/feeds/:feed_id/items` — Get feed items
-- `DELETE /api/feeds/:feed_id` — Delete a feed
+| 端点 | 语义 |
+|---|---|
+| `GET /api/health` | 健康 + 全池计数 + `newest_published_at`（<48h 契约） |
+| `GET /api/diagnostics` | 调度 / feed 健康 / cron_ticks / 抓取运行观测 |
+| `GET /api/feeds` | **共享池目录（Discover-only）**，非设备视图 |
+| `POST /api/feeds` | find-or-create + 订到本设备。body `{url,title}` → `{feed, created, already}` |
+| `GET /api/me/feeds` | **本设备**列表（navigation-only；需 `X-User-Id`，匿名 400） |
+| `POST /api/feeds/:id/subscribe` | 本设备订阅池内源（Discover「+」） |
+| `POST /api/feeds/:id/fetch` | 单源立即抓取（fetch → parse → persist） |
+| `GET /api/feeds/:id/articles` | 该源文章（50 条窗口，DESC） |
+| `DELETE /api/feeds/:id` | **退订本设备**；最后订阅者 → 连池 prune。→ `{id, pruned}` |
+| `/api/sources`（全 method） | **retired 501**：dormant `rss_sources` 原型层不可达（见 ARCHITECTURE §3） |
 
-## Setup
+legacy 兼容：`GET /health`、`GET /feed`、`GET /feed/:id` 保留不回退（新代码一律走 `/api/*`）。
 
-### Prerequisites
-- [Rust](https://www.rust-lang.org/tools/install) 1.56+
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
-- Cloudflare account with Workers enabled
-- D1 database created in Cloudflare
+## 迁移（001–007）
 
-### Installation
+| 迁移 | 内容 |
+|---|---|
+| 001_init | `feeds` / `articles` 基表 |
+| 002_add_error_message | `feeds.error_message` |
+| 003_cron_ticks | cron 心跳观测表 |
+| 004_rss_sources | dormant 原型层（`rss_sources`/`rss_articles`，**逐字节保留**，代码已退休） |
+| 005_feed_health_fetch_runs | feed 健康 + `fetch_runs` 运行观测 |
+| 006_default_feeds | 一次性空库种入默认源（幂等、非 reconcile） |
+| 007_device_profiles | `profiles`（设备命名空间注册表）+ `subscriptions.user_id` 引用 |
 
-1. Clone the repository
-   ```bash
-   git clone <repository-url>
-   cd D:\Project\RSS
-   ```
+## 开发 / 测试 / 部署
 
-2. Install dependencies
-   ```bash
-   npm install
-   ```
-
-3. Build the project
-   ```bash
-   wrangler build
-   ```
-
-4. Set up the database
-   ```bash
-   wrangler d1 execute <database-name> < migrations/001_init.sql
-   ```
-
-## Development
-
-### Local Testing
-```bash
-wrangler dev
-```
-
-The worker will be available at `http://localhost:8787`
-
-### Build
-```bash
-wrangler build
-```
-
-### Deploy
-```bash
-wrangler deploy
-```
-
-## Testing
-
-The core logic — RSS/Atom feed parsing, utilities, and data models — is
-covered by native Rust unit tests:
+全部环境配置（`.env` 模板、wrangler secrets、CF ID、部署命令）在 [SETUP.md](SETUP.md)，
+README 不重复。测试矩阵（单测 / functional / drills / perf / 契约 / 前端 build）在
+[TESTING.md](TESTING.md)。一句话：
 
 ```bash
-cargo test
+cargo test --all                       # 73 native 单测
+pwsh scripts/test-functional.ps1       # 只读 functional（dev/prod URL）
+node scripts/ws7-device-drill.mjs      # 设备隔离演练（dev-only，refuse prod）
+node scripts/check-articles-contract.mjs  # 生产只读契约（feeds==D1、published_at canonical、<48h）
+cd frontend && npm run build           # Astro 构建 → wrangler pages deploy dist
 ```
-
-Coverage by module:
-
-- `src/feed.rs` — RSS 2.0 / Atom parsing, entity + CDATA handling, GUID
-  fallback, namespace-prefixed tags, malformed XML errors, and article hash
-  generation.
-- `src/types.rs` — serde serialization/deserialization round-trips for every
-  model and request/response payload.
-- `src/utils.rs` — ID generation format, RFC 3339 timestamps, URL validation.
-
-> **Note:** Handlers that depend on the Cloudflare Worker runtime
-> (`worker::Request` / `Response`, D1, KV, fetch) execute inside a
-> WebAssembly sandbox, so they cannot be exercised by host `cargo test`.
-> They should be validated with `wrangler dev` and HTTP requests against the
-> running worker.
-
-## Dependencies
-
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `worker` | 0.8.5 | Cloudflare Workers SDK |
-| `serde` | 1.0 | Serialization/deserialization |
-| `serde_json` | 1.0 | JSON handling |
-| `chrono` | 0.4 | Date/time operations |
-| `uuid` | 1.0 | ID generation |
-| `tokio` | 1.0 | Async runtime |
-| `reqwest` | 0.11 | HTTP requests |
-
-## Database Schema
-
-### feeds
-- `id` (TEXT PRIMARY KEY) — Unique feed identifier
-- `url` (TEXT NOT NULL UNIQUE) — Feed source URL
-- `title` (TEXT NOT NULL) — Feed title
-- `description` (TEXT) — Feed description
-- `created_at` (TEXT NOT NULL) — Creation timestamp
-- `updated_at` (TEXT NOT NULL) — Last update timestamp
-
-### feed_items
-- `id` (TEXT PRIMARY KEY) — Unique item identifier
-- `feed_id` (TEXT NOT NULL FK) — Reference to parent feed
-- `title` (TEXT NOT NULL) — Item title
-- `description` (TEXT) — Item description/content
-- `link` (TEXT NOT NULL) — Item source link
-- `published_at` (TEXT) — Publication timestamp
-- `created_at` (TEXT NOT NULL) — Creation timestamp
-
-## Performance Optimization
-
-- **KV Cache** — Feed parsing results cached in Cloudflare KV
-- **Database Indexing** — Optimized queries with indexes on `feed_id` and `published_at`
-- **Edge Execution** — Content delivered from edge locations globally
-
-## Security
-
-- Input validation for all URLs
-- SQL injection prevention through prepared statements
-- Rate limiting via Cloudflare
-- CORS headers configured appropriately
-- Environment variables for sensitive data
-
-## Troubleshooting
-
-### Build fails with "cannot find package `worker`"
-```bash
-cargo update
-cargo build
-```
-
-### Database connection fails
-- Verify D1 database is linked in `wrangler.toml`
-- Check database name matches
-- Run migrations: `wrangler d1 execute <db-name> < migrations/001_init.sql`
-
-### Feed parsing returns empty results
-- Verify feed URL is accessible
-- Check feed format (RSS 2.0 or Atom)
-- Review logs: `wrangler tail`
-
-## Contributing
-
-1. Create a feature branch
-2. Make your changes
-3. Test locally with `wrangler dev`
-4. Deploy to staging
-5. Submit a pull request
-
-## License
-
-MIT
-
-## Support
-
-For issues and questions:
-- 📖 [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
-- 🦀 [Rust Documentation](https://doc.rust-lang.org/)
-- 📡 [RSS Standard](https://www.rssboard.org/)
-- 🔗 [Atom Syndication Format](https://tools.ietf.org/html/rfc4287)
-
----
-
-Built with ❤️ on Cloudflare Workers

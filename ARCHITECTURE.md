@@ -325,10 +325,14 @@ last_modified`。
     措辞在 ARCHITECTURE/`identity.rs`/migration 注释统一；`/api/feeds` Discover-only /
     `/api/me/feeds` navigation-only 不变式、池状态机（0 订阅 dormant / ≥1 active）、双门抓取
     均写入 §3.2/§5。
-  - **Gate 2（部署验收，待回填）**：dev 先行（apply 007 → 迁移门 → 部署 → 双假设备隔离演练
-    → functional/perf）后 prod 按评审 #9 顺序（apply 007 → worker 部署 → **紧邻** Pages →
-    **立即**真实浏览器订阅保留源 → 等 cron → 契约脚本 → 隐身第二设备验隔离）。结果与
-    Discover 源数快照记入 `PRODUCTION_BASELINE.md`「WS7 设备模型」。
+  - **Gate 2（部署验收，2026-09-06 完成，证据详见 PRODUCTION_BASELINE.md「WS7 设备模型」）**：
+    prod 按评审 #9 顺序上线（apply 007 → worker 部署 → 紧邻 Pages → 立即真实浏览器订阅保留
+    源 → 等 cron → 契约脚本）。证据构成：**API 层 19/19 PASS**（匿名 400、两全新 key 空起步、
+    订 HN `created:true`、订池内 BBC `created:false` 收敛、退订共享 BBC `pruned:false`、唯一
+    订阅者退订 HN `pruned:true` + 池恢复、重订 `created:false` 收敛）；**真实浏览器主设备**
+    My Feeds = 本设备订阅集，池内他设备订阅的源不出现；**契约脚本** feeds==D1 + `<48h`
+    ALL PASSED。全新第二设备的空起步 / 互不影响由 API 双 key + 真浏览器新窗口确认（操作者
+    接受，未另跑 prod 别名隐身窗口）。验收时 Discover 池源数 = 12（见 PRODUCTION_BASELINE）。
 
 - [x] **WS7.1 Discover 推荐目录（2026-09-06）**：给新设备一个 curated on-ramp ——
   **内置静态推荐目录**，worker 0 changes（无新表 / 无新 API / 不自动订阅 / 不建第二套 Feed
@@ -358,6 +362,11 @@ last_modified`。
     Mozilla Hacks 低产但活 → C；arXiv 两个官方宿主均空 → 不入。Security 空、Engineering
     仅 NASA —— 宁缺毋滥，要补类另开一轮 edge 验证再入目录（**不把非 GREEN 或已判 AMBER
     的源留在定稿目录**）。
+  - **上线（2026-09-06）**：Pages production @ commit `1eb1257`（deploy `12b2c729`，branch
+    master）；**纯前端，worker 未重部署**（0 改动）。真实浏览器 smoke（操作者接受）：主设备
+    已订目录源 ✓（恰为其订阅集 ∩ 目录）、未订 +；My Feeds 不含池内他设备订阅源；全新设备
+    首见 Recommended 19 全 +、池尾段仅露「非目录且未订」的池源。遗留外观项（pre-existing，
+    非 WS7.1 引入）见 §8。
 
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 
@@ -380,3 +389,9 @@ OpenAI News，`fetch_interval_minutes=15`、`enabled=1`、`next_fetch_at=NULL`�
 - [ ] 数据迁移脚本参数化 DB id 后入库（当前读 `.env`）。
 - [ ] 模块拆分（api/fetcher/parser/persistence）为可选重构，不阻塞业务。
 - [ ] CI：worker deploy + pages deploy workflow 固化（当前仅 rust.yml）。
+- [ ] 前端相对时间对 **naive-UTC scheduler 时间戳**（`scheduler.last_run.started_at` /
+      `last_fetch_run.started_at` 等，形如 `"2026-09-06 12:15:22"`，无 `Z`）按本机时区解析：
+      `timeAgo`/`new Date` 在非 UTC 设备把「X 分钟前」偏成 +8h（UTC+8 实测 sync / feed `last`
+      行偏移约 8h）。**pre-existing，WS7.1 未引入**（文章时间已是 canonical-ISO，无此问题）。
+      修法候选：worker 输出侧给这类时间补 `Z`（naive 值即 UTC 墙上时间），或前端对无时区
+      时间戳显式按 UTC 解析。

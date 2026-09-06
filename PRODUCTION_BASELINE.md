@@ -192,20 +192,51 @@ INTEGER id），**非鉴权、非用户账户**。
 Pages 部署 → **立即**在真实主浏览器订阅要保留的池源（否则新订阅门一开 0 订阅源即停刷，
 `newest_published_at` 会老化出 <48h）→ 等一个 cron 周期 → 跑契约脚本 → 隐身窗口验隔离。
 
-> 下方「WS7 部署后验收快照」在 Gate 2 实际部署完成后用真实 curl 结果回填，勿在部署前
-> 凭本地写死数字。
+> 下方快照为 Gate 2 **实际部署完成后**的真实回填（2026-09-06）。证据来源三分：API 层 =
+> production 合成 key 实测（19/19 断言，逐条记录真实返回）；浏览器层 = 真实浏览器主设备 +
+> 全新 key 新窗口；操作者接受该证据组合，**未另跑 prod 别名上的隐身窗口**（未做即不写
+> 「隐身实测」）。
 
-### WS7 部署后验收快照（Gate 2 回填）
+### WS7 部署后验收快照（Gate 2，2026-09-06 回填）
 
 | 断言 | 结果 |
 |---|---|
-| apply 007 后 `sqlite_master` 见 `profiles`；apply 前 `subscriptions`=0 | 待填 |
-| 匿名 `GET /api/me/feeds` → 400 `X-User-Id header required` | 待填 |
-| 主浏览器订阅保留源后，`GET /api/me/feeds` == 该设备订阅集合 | 待填 |
-| 隐身第二设备 `GET /api/me/feeds` 为空（互不影响） | 待填 |
-| `/api/feeds` 仍 = 池目录（Discover），非设备视图 | 待填 |
-| 共享源退订 → `pruned:false`；独享源退订 → `pruned:true` 且源从池消失 | 待填 |
-| `node scripts/check-articles-contract.mjs`：feeds==D1、`<48h` 成立 | 待填 |
+| apply 007 后 `sqlite_master` 见 `profiles`；apply 前 `subscriptions`=0 | ✅ apply 先于 worker 上线（评审 #9）；apply 前生产 `subscriptions` 已 0 行 → 007 纯建表 no-op；apply 后 `profiles` 生效，真实/演练设备 key 均经 `require_profile` 映射为 INTEGER id |
+| 匿名 `GET /api/me/feeds` → 400 `X-User-Id header required` | ✅ 实测 400，结构化 body `error:"X-User-Id header required"`（匿名不进入设备命名空间） |
+| 主浏览器订阅保留源后，`GET /api/me/feeds` == 该设备订阅集合 | ✅ 主浏览器 My Feeds = 本设备订阅集（验收时 6 条：OpenAI/BBC/NYT/V2EX/量子位/GitHub Blog）；池内主设备未订的源（Guardian/HN/阮一峰）不出现在本设备列表 |
+| 第二设备 `GET /api/me/feeds` 为空（互不影响） | ✅ API 层：两全新 key 起步均 `[]`，其一订阅后另一 key 列表不变（隔离双向）；真浏览器：全新 key 新窗口 My Feeds=0 / Recommended 19 全 + |
+| `/api/feeds` 仍 = 池目录（Discover），非设备视图 | ✅ 只读快照 12 行 = 全池（含主设备未订的 Guardian/HN/阮一峰）≠ 主设备 6 条 |
+| 共享源退订 → `pruned:false`；独享源退订 → `pruned:true` 且源从池消失 | ✅ production API 实测：设备 A 退订共享 BBC → `{"id":2,"pruned":false}`（真实主设备仍持它）；唯一订阅者退订 HN(feed14) → `{"id":14,"pruned":true}`，feed+articles 一并 prune，池精确恢复 {1,2,3,7,9,13} |
+| `node scripts/check-articles-contract.mjs`：feeds==D1、`<48h` 成立 | ✅ 只读复跑 ALL PASSED：每 feed 50 窗非空、全 canonical、DESC 单调；`newest_published_at` 2026-09-06T12:26:44Z <48h |
+
+验收证据（真实返回，2026-09-06）：
+
+- **API 层（production，合成 key A/B）**：`GET /api/me/feeds` 匿名 → 400
+  `X-User-Id header required`；A、B 两全新 key → 各 `[]`；A `POST /api/feeds`（HN）→
+  `{feed id14, created:true}`，随后 **B 列表仍 `[]`**（A 订阅不泄漏给 B）→ B 订池内 BBC →
+  `{feed id2, created:false}`（收敛，不重复建源）→ B 退订 BBC → `{"id":2,"pruned":false}`
+  （真实主设备仍持它，共享源不因单设备退订而清池）→ A 退订 HN → `{"id":14,"pruned":true}`
+  （唯一订阅者退订，feed+articles 一并 prune）→ 重订 HN → `{created:false}` 收敛同 id14。
+  19/19 断言 PASS，池最终精确恢复 {1,2,3,7,9,13}。
+- **真实浏览器（主设备，WS7.1 Pages 上线后）**：My Feeds = 本设备订阅集；Recommended 中已订
+  目录源显示 ✓（恰为本设备订阅集 ∩ 目录）、未订显示 +；Shared Pool 尾段只露「池内非目录且
+  本设备未订」的源。
+- **全新第二设备**：API 双 key 互不影响（隔离双向）+ 真浏览器新窗口（全新 key，localhost
+  预览直连生产 API）My Feeds=0、Recommended 19 全 +、Shared Pool 尾段 = NYT + 阮一峰。
+  操作者接受该证据组合，未另跑 prod 别名上的隐身窗口。
+
+### WS7.1 Discover 目录上线（2026-09-06，纯前端）
+
+- Pages production @ commit `1eb1257`（deploy `12b2c729`，branch master）。**worker 0 改动**：
+  WS7 遗留 worker 版本未重部署（无新表 / 无新 API / 无自动订阅）。
+- Discover = Recommended Catalog（19 GREEN，`frontend/src/lib/recommended-feeds.ts`，按
+  category 分组）+ Shared Pool 尾段，两段独立 render、绝不合并。目录行 `+` →
+  `addFeed(url,name)`（find-or-create + 订到本设备）；池尾行 `+` → `subscribeFeed(id)`。
+- 真实浏览器 smoke（操作者接受）：主设备已订目录源 ✓ / 未订 +；My Feeds 不变、不含池内他
+  设备订阅源；全新设备首见 19 全 +。
+- 验收时池源数快照：12 行全 active；池内**非目录**残留仅 2 行 = NYT + 阮一峰。目录行（含已入
+  池的 Guardian/HN/OpenAI/BBC/V2EX/量子位/GitHub/MIT/Ars/Register）因 collision 规则永不进池尾段
+  → 新设备池尾段 = 这 2 行；主设备自持 NYT → 其池尾段仅阮一峰。
 
 ## 基线用途
 
