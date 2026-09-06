@@ -88,11 +88,36 @@ pub async fn add_feed(mut req: Request, env: Env) -> Result<Response> {
 
     match stmt.bind_refs(args.iter()) {
         Ok(bound_stmt) => match bound_stmt.first::<Value>(None).await {
-            Ok(result) => Response::from_json(&ApiResponse {
-                success: true,
-                data: result,
-                error: None,
-            }),
+            Ok(result) => {
+                // Best-effort initial fetch: enqueue immediately so the first
+                // articles arrive without waiting for the cron pass. The
+                // payload URL is read from the stored RETURNING row (==
+                // feeds.url), not re-derived from the request, so the queue
+                // always fetches what the table holds.
+                if let Some(row) = result.as_ref() {
+                    if let (Some(feed_id), Some(feed_url)) = (
+                        row.get("id").and_then(serde_json::Value::as_i64),
+                        row.get("url").and_then(serde_json::Value::as_str),
+                    ) {
+                        crate::queue::enqueue_initial_fetch(
+                            &env,
+                            serde_json::json!({
+                                "version": 1,
+                                "type": "feed_fetch",
+                                "feed_id": feed_id,
+                                "url": feed_url,
+                            }),
+                            "feed",
+                        )
+                        .await;
+                    }
+                }
+                Response::from_json(&ApiResponse {
+                    success: true,
+                    data: result,
+                    error: None,
+                })
+            }
             Err(e) => Response::from_json(&ApiResponse::<()> {
                 success: false,
                 data: None,

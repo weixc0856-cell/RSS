@@ -118,11 +118,31 @@ async fn create_source_inner(
         .await?;
 
     match created {
-        Some(source) => Response::from_json(&ApiResponse {
-            success: true,
-            data: Some(source),
-            error: None,
-        }),
+        Some(source) => {
+            // Best-effort initial fetch (same contract as the feeds add path):
+            // enqueue right after insert so the first articles arrive without
+            // waiting for cron. Payload fields come from the stored SourceItem
+            // row so queue and table agree.
+            if let Some(source_id) = source.id {
+                crate::queue::enqueue_initial_fetch(
+                    env,
+                    serde_json::json!({
+                        "version": 1,
+                        "type": "source_fetch",
+                        "source_id": source_id,
+                        "user_id": user_id,
+                        "url": source.url.clone(),
+                    }),
+                    "source",
+                )
+                .await;
+            }
+            Response::from_json(&ApiResponse {
+                success: true,
+                data: Some(source),
+                error: None,
+            })
+        }
         None => Response::error("source already exists for this user", 409),
     }
 }

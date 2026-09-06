@@ -172,6 +172,40 @@ fn normalize_body(body: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Best-effort enqueue of one initial-fetch job right after a feed/source is
+/// created, so the first articles arrive without waiting for the next cron pass.
+///
+/// Never fails the create that already succeeded: on any enqueue error we log
+/// loudly and the scheduler remains the fallback (both INSERTs set the row due
+/// immediately — `next_fetch_at = datetime('now')` for feeds, `last_fetched_at
+/// IS NULL` for sources — so the next cron cycle still fetches it).
+///
+/// Sends a JSON *string* body (the same rationale as the scheduler: worker-rs
+/// serializes a `Value` object into a JS object whose properties the runtime
+/// drops on `queue.send`). No `run_id` is attached: the consumer's `record_run`
+/// no-ops on `None`, so a manual job never corrupts `fetch_runs` accounting.
+///
+/// Note (accepted): duplicate enqueue is possible in the few seconds between
+/// create and consumer completion if cron fires in that window. Article
+/// persistence stays idempotent (`INSERT OR IGNORE`), but duplicate outbound
+/// fetches during that overlap are not prevented in this round.
+pub async fn enqueue_initial_fetch(env: &Env, payload: serde_json::Value, label: &str) {
+    let body = match serde_json::to_string(&payload) {
+        Ok(body) => body,
+        Err(error) => {
+            console_error!("[{label}] initial enqueue serialization failed error={error}");
+            return;
+        }
+    };
+    match env.queue("RSS_FETCH_QUEUE") {
+        Ok(queue) => match queue.send(body.as_str()).await {
+            Ok(_) => console_log!("[{label}] initial enqueue sent body={body}"),
+            Err(error) => console_error!("[{label}] initial enqueue failed error={error:?}"),
+        },
+        Err(error) => console_error!("[{label}] initial enqueue binding failed error={error:?}"),
+    }
+}
+
 /// Accumulate the outcome of one queued job onto its `fetch_runs` row and mark
 /// the run finished once every scheduled job has reported back.
 ///
