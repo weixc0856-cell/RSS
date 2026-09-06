@@ -92,9 +92,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Feed management
         (Method::Get, "/api/feeds") => handle_get_feeds(env).await,
         (Method::Post, "/api/feeds") => handle_create_feed(req, env).await,
-        (Method::Delete, path) if path.starts_with("/api/feeds/") && !path.ends_with("/articles") && !path.ends_with("/subscribe") => {
+        (Method::Delete, path) if path.starts_with("/api/feeds/") && !path.ends_with("/articles") && !path.ends_with("/subscribe") && !path.ends_with("/fetch") => {
             if let Ok(feed_id) = path.strip_prefix("/api/feeds/").unwrap_or("").parse::<i32>() {
-                handle_delete_feed(feed_id).await
+                handle_delete_feed(feed_id, env).await
             } else {
                 Response::error("Invalid feed ID", 400)
             }

@@ -221,6 +221,18 @@ pub async fn delete_source(req: Request, user_id: &str, env: &Env) -> Result<Res
     };
 
     let db = db::get_db(env)?;
+
+    // Ownership check first: a delete of a source this user does not own (or
+    // that does not exist) must 404, not silently report success.
+    let owned = db
+        .prepare("SELECT id FROM rss_sources WHERE id = ?1 AND user_id = ?2")
+        .bind(&[(id as i32).into(), user_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    if owned.is_none() {
+        return Response::error("Source not found", 404);
+    }
+
     db.prepare("DELETE FROM rss_articles WHERE user_id = ?1 AND source_id = ?2")
         .bind(&[user_id.into(), (id as i32).into()])?
         .run()

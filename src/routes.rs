@@ -322,45 +322,66 @@ pub async fn handle_health(env: Env) -> Result<Response> {
     })
 }
 
-pub async fn handle_get_user_feeds(user_id: i32) -> Result<Response> {
-    Response::from_json(&ApiResponse::<Vec<Feed>> {
+pub async fn handle_get_user_feeds(_user_id: i32) -> Result<Response> {
+    json_error("Not implemented", 501)
+}
+
+/// Dead API — the `subscriptions` table is not the product's data model. Kept
+/// reachable but honest: 501, and guaranteed to never write D1 (subscriptions/
+/// feeds/articles untouched). A dead API, not a half-usable one.
+pub async fn handle_subscribe_feed(_req: Request) -> Result<Response> {
+    json_error("Not implemented", 501)
+}
+
+/// JSON error body for business APIs that already speak the `ApiResponse`
+/// contract — only for turning prior `success:true` + error-text lies into an
+/// honest status. Plain HTTP errors (400/404/405…) keep `Response::error`.
+fn json_error(message: &str, status: u16) -> Result<Response> {
+    let response = Response::from_json(&ApiResponse::<()> {
+        success: false,
+        data: None,
+        error: Some(message.to_string()),
+    })?;
+    Ok(response.with_status(status))
+}
+
+/// Global feed deletion — NOT a per-user unsubscribe. It removes the shared
+/// feed, its articles and every subscription row. Explicit three-statement
+/// delete so the contract stays visible and independent of any implicit FK
+/// cascade behavior.
+pub async fn handle_delete_feed(feed_id: i32, env: Env) -> Result<Response> {
+    let db = db::get_db(&env)?;
+
+    let existing = db
+        .prepare("SELECT id FROM feeds WHERE id = ?1")
+        .bind(&[feed_id.into()])?
+        .first::<Value>(None)
+        .await?;
+    if existing.is_none() {
+        return Response::error("Feed not found", 404);
+    }
+
+    db.prepare("DELETE FROM subscriptions WHERE feed_id = ?1")
+        .bind(&[feed_id.into()])?
+        .run()
+        .await?;
+    db.prepare("DELETE FROM articles WHERE feed_id = ?1")
+        .bind(&[feed_id.into()])?
+        .run()
+        .await?;
+    db.prepare("DELETE FROM feeds WHERE id = ?1")
+        .bind(&[feed_id.into()])?
+        .run()
+        .await?;
+
+    Response::from_json(&ApiResponse {
         success: true,
-        data: Some(Vec::new()),
+        data: Some(serde_json::json!({ "id": feed_id })),
         error: None,
     })
 }
 
-pub async fn handle_subscribe_feed(mut req: Request) -> Result<Response> {
-    match req.json::<SubscribeFeedRequest>().await {
-        Ok(_payload) => {
-            Response::from_json(&ApiResponse::<Subscription> {
-                success: true,
-                data: None,
-                error: Some("Not implemented".to_string()),
-            })
-        }
-        Err(e) => {
-            Response::from_json(&ApiResponse::<()> {
-                success: false,
-                data: None,
-                error: Some(format!("Invalid request: {}", e)),
-            })
-        }
-    }
-}
-
-pub async fn handle_delete_feed(feed_id: i32) -> Result<Response> {
-    Response::from_json(&ApiResponse::<()> {
-        success: true,
-        data: None,
-        error: Some("Not implemented".to_string()),
-    })
-}
-
-pub async fn handle_unsubscribe_feed(user_id: i32, feed_id: i32) -> Result<Response> {
-    Response::from_json(&ApiResponse::<()> {
-        success: true,
-        data: None,
-        error: Some("Not implemented".to_string()),
-    })
+/// Dead API — same as subscribe: honest 501, no D1 side effects.
+pub async fn handle_unsubscribe_feed(_user_id: i32, _feed_id: i32) -> Result<Response> {
+    json_error("Not implemented", 501)
 }
