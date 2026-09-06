@@ -63,7 +63,10 @@ rss-worker (rss-worker.weixc0856.workers.dev)  →  D1 rss-db-dev   （默认/�
 - **数据平面 = `feeds` + `articles`**（抓取器写、API 读、前端调）；`rss_sources` /
   `rss_articles` 是 dormant 用户源原型层（0 行属预期），前端从不调用 —— 不是数据丢失。
   **方向定稿（2026-09-06）：feeds/articles 是唯一生产模型**。用户源原型层不再演进，
-  不迁移、不删除；删除/下线属独立决定，未明确授权不动 —— 当前保留以维持 API/schema 兼容。
+  WS5（同日）已授权落地为 **code retired / data dormant**：运行期读写该层的代码与
+  用户身份模型已退休删除，`/api/sources` 收口成诚实 501 retired API；
+  `rss_sources`/`rss_articles` **表与数据逐字节保留**（不 drop、不迁移），
+  diagnostics 仍读 dormant 计数（见 §7 WS5）。
 
 ### 3.1 `published_at` 排序契约（不变量，2026-09-03）
 
@@ -142,8 +145,9 @@ last_modified`。
   有 `Origin` 且命中 → 回显该 origin；无 `Origin`（curl、Worker 内部 scheduler/queue）或
   未命中 → 不设 `Access-Control-Allow-Origin`。**CORS 是浏览器访问控制，不是 API 认证**：
   服务端/curl 调用不受影响，`is_allowed_origin` 单测覆盖前缀/端口/宿主绕过负例。
-- `Access-Control-Allow-Headers: Content-Type, X-User-Id`、
+- `Access-Control-Allow-Headers: Content-Type`、
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`、`Max-Age: 86400`。
+  源层身份头 `X-User-Id` 已随 `/api/sources` 退休摘除（见 §7 WS5）—— 无端点读取它，不再在 CORS 广告。
 - **API 错误 ≠ 空数组**：`list_feeds`/列表类错误路径返回 500，不伪装成 `[]`；真空表返回的
   `[]` 是真“空”，前端据此区分“错误（可重试）”与“无数据”。
 
@@ -211,6 +215,35 @@ last_modified`。
     属主隔离 404、diagnostics 新增字段）全绿。
   - 部署：生产 `rss-worker-production` v`55782b68`、dev `rss-worker` v`e11df86b`。
 
+- [x] **WS5 源层退休（2026-09-06）**：dormant prototype layer 收口为 **code retired /
+  data dormant**（commit `79ae355`，`refactor(api): retire user-scoped /api/sources`）。
+  方向沿用「feeds 即产品」（§3）。统一词汇：`rss_sources`/`rss_articles` = dormant
+  prototype layer、`/api/sources` = retired API、source pipeline = retired。
+  - **HTTP**：lib.rs 六条 source dispatch 分支 → 一条语义边界 guard
+    （`p == "/api/sources" || p.starts_with("/api/sources/")`，非裸前缀）→
+    `handle_sources_retired()`：任意 method/子路径一律 **501 `success:false`**、
+    **绝不写 D1**（retired API，非 half-usable），无需 `X-User-Id`；走 match 内统一
+    `apply_api_headers`（no-store/CORS 照常）。`Access-Control-Allow-Headers` 摘除
+    `X-User-Id`（已无端点读它，见 §6.1）。
+  - **运行期**：queue 删 `SourceJob` / `RoutedJob::Source` 变体 / consume Source 臂；
+    `route_job` 对 typed `source_fetch` 与 legacy `{source_id,user_id}` 形状一律
+    **显式退休拒绝**（Unsupported）；scheduler 删 rss_sources 选择 + source_fetch
+    入队臂。**在途历史 source_fetch 记 1 failed** = 既有 Unsupported 契约（使所属 run
+    能终结），注释明示 `feeds_failed` 含 rejected/unsupported/retired —— 真实网络抓取
+    失败活在 feed 行（`error_message`/`consecutive_failures`），不在此计数。
+  - **Retired code 删除**：`src/sources.rs`（450 行）+ `src/auth.rs` + lib.rs `mod`
+    声明 + types.rs 源层类型（`SourceItem`/`CreateSourceRequest`/`RssArticle` 等）。
+    auth 身份模型（`current_user`/`X-User-Id`）删除前已做**全仓引用验证**（Rust/
+    frontend/scripts/migrations/docs 均零残留调用）。feeds 层死订阅 stub（WS1 已
+    501）与 feeds/articles 运行期代码不受影响。
+  - **Gate**：native **71 tests**（删 4、增 2：typed + legacy source_fetch 退休拒绝
+    单测锁死行为）；wasm `cargo check --tests` 干净；前端零改动 build+typecheck 通过。
+    部署后 Gate 2：生产/开发 `/api/sources` 全 method 501、`/api/feeds` `/api/health`
+    `/api/diagnostics` 不受影响；diagnostics 仍读 dormant 表计数（生产 0/0 不变，dev
+    历史行停止刷新）；生产 `check-articles-contract.mjs` 全 PASS；OPTIONS 预检
+    `Allow-Headers` 仅 `Content-Type`。
+  - 部署：生产 `rss-worker-production` v`ae54114e`、dev `rss-worker` v`1f6d1a8f`。
+
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 
 `migrations/006_default_feeds.sql` 幂等地种入当前 3 个健康源（NYT World / BBC News /
@@ -224,10 +257,11 @@ OpenAI News，`fetch_interval_minutes=15`、`enabled=1`、`next_fetch_at=NULL`�
 
 ## 8. 待办 / 后续
 
-- [ ] （方向已定为 feeds 即产品，2026-09-06）`rss_sources` / `rss_articles` 冻结层
-      **最终去向待单独授权**：当前不迁移不删除；可选后续为「归档下线（含 /api/sources
-      表面去留、TESTING.md 用户源用例去留）」或「只读保留」，属破坏性/产品表面决定，
-      不在未授权时执行。
+- [x] （方向已定为 feeds 即产品，2026-09-06）`rss_sources` / `rss_articles` dormant 层
+      **去向已授权落地（WS5，同日，见 §7 WS5）**：code retired / data dormant ——
+      运行期读写代码退休、`/api/sources` 收口成 501 retired API，表与数据**逐字节保留**
+      （不 drop、不迁移），diagnostics 保留 dormant 计数。无遗留后续项（若未来要清表/
+      删列仍属破坏性决定，须单独授权）。
 - [ ] 数据迁移脚本参数化 DB id 后入库（当前读 `.env`）。
 - [ ] 模块拆分（api/fetcher/parser/persistence）为可选重构，不阻塞业务。
 - [ ] CI：worker deploy + pages deploy workflow 固化（当前仅 rust.yml）。
