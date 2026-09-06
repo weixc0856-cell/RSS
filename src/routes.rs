@@ -209,12 +209,18 @@ pub async fn handle_get_my_feeds(req: Request, env: Env) -> Result<Response> {
         Err(message) => return json_error(&message, 400),
     };
     let db = db::get_db(&env)?;
+    // NOTE: `feeds` stays the only FROM table here (no JOIN with subscriptions):
+    // the projection's bare `id` / `created_at` would otherwise collide with
+    // subscriptions' columns and D1 rejects it as "ambiguous column name".
+    // `subscribed_at` / article_count arrive via correlated subqueries instead.
     let stmt = db.prepare(&format!(
         "SELECT {FEED_PROJECTION},
-                s.subscribed_at,
+                (SELECT s.subscribed_at FROM subscriptions s
+                 WHERE s.feed_id = f.id AND s.user_id = ?1) AS subscribed_at,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) AS article_count
-         FROM feeds f JOIN subscriptions s ON s.feed_id = f.id
-         WHERE s.user_id = ?1 ORDER BY f.id DESC"
+         FROM feeds f
+         WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.feed_id = f.id AND s.user_id = ?1)
+         ORDER BY f.id DESC"
     ));
     let rows = stmt.bind(&[profile_id.into()])?.all().await?;
     let feeds = rows.results::<Value>()?;
