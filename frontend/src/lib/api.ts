@@ -86,6 +86,13 @@ export async function addFeed(url: string, title: string): Promise<Feed> {
   });
 }
 
+/** Global feed deletion — removes the feed and every article it stored. */
+export async function deleteFeed(feedId: number): Promise<{ id: number }> {
+  return request<{ id: number }>(`/api/feeds/${feedId}`, {
+    method: "DELETE",
+  });
+}
+
 /** Human friendly relative time from an RFC3339/RSS date string. */
 export function timeAgo(value: string | null): string {
   if (!value) return "unknown";

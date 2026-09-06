@@ -1,6 +1,7 @@
 import {
   ApiError,
   addFeed,
+  deleteFeed,
   domainOf,
   getArticles,
   getDiagnostics,
@@ -127,17 +128,24 @@ function renderNav(): void {
       const metaErr = health.tone === "err" ? "err" : "";
       const active = f.id === activeFeedId ? "active" : "";
       const tip = `${health.badge} · ${health.detail}`;
-      return `<button class="nav-item ${active}" type="button" data-feed="${f.id}" title="${escapeHtml(
+      // A feed row is a wrapper div holding the select <button> plus a sibling
+      // remove <button> — buttons cannot nest, so the ✕ lives outside .nav-item.
+      // `title`/`tip` here are already escaped: safe to inject into attributes.
+      return `<div class="feed-item ${active}">
+        <button class="nav-item ${active}" type="button" data-feed="${f.id}" title="${escapeHtml(
         tip
       )}">
-        <span class="nav-row">
-          <span class="${dotCls}"></span><span class="nav-title">${title}</span>
-        </span>
-        <span class="nav-meta ${metaErr}">
-          <span class="health-badge">${escapeHtml(health.badge)}</span>
-          <span>${escapeHtml(health.detail)}</span>
-        </span>
-      </button>`;
+          <span class="nav-row">
+            <span class="${dotCls}"></span><span class="nav-title">${title}</span>
+          </span>
+          <span class="nav-meta ${metaErr}">
+            <span class="health-badge">${escapeHtml(health.badge)}</span>
+            <span>${escapeHtml(health.detail)}</span>
+          </span>
+        </button>
+        <button class="nav-remove" type="button" data-action="remove-feed" data-feed="${f.id}"
+                title="Remove ${title} and its stored articles" aria-label="Remove ${title}">✕</button>
+      </div>`;
     })
     .join("");
   els.feedNav.innerHTML =
@@ -328,11 +336,39 @@ function selectFeed(id: number): void {
   void loadArticles();
 }
 
+/** Global feed deletion (worker removes the feed + its articles). Guarded by a
+ *  confirm that names the feed. The id may already be gone from state by the
+ *  time this runs (async destructive action), so it exits quietly when the feed
+ *  is no longer resolvable. */
+async function removeFeed(id: number): Promise<void> {
+  const feed = feedById(id);
+  if (!feed) return;
+  // Plain-text name for the dialog/toast — never HTML-escaped here.
+  const rawName = feed.title || domainOf(feed.url);
+  const ok = window.confirm(
+    `Remove "${rawName}" and all its stored articles from the shared catalog? This cannot be undone.`
+  );
+  if (!ok) return;
+  try {
+    await deleteFeed(id);
+    await loadAll();
+    toast(`Removed ${rawName}`);
+  } catch (err) {
+    toast(err instanceof ApiError ? err.message : String(err), true);
+  }
+}
+
 // --- Events -----------------------------------------------------------------
 els.feedNav.addEventListener("click", (event) => {
   const action = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
   if (action?.dataset.action === "retry-feeds") {
     void loadFeeds();
+    return;
+  }
+  // Remove must be handled before the [data-feed] select branch, otherwise
+  // clicking the ✕ would also select the feed underneath it.
+  if (action?.dataset.action === "remove-feed") {
+    void removeFeed(Number(action.dataset.feed));
     return;
   }
   const btn = (event.target as HTMLElement).closest<HTMLElement>("[data-feed]");

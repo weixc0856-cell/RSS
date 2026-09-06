@@ -131,6 +131,61 @@
   color: rgba(255, 255, 255, 0.88);
 }
 
+/* Remove-feed affordance: a hover-only ✕ pinned to the top-right of each row.
+   Each row is now .feed-item (wrapper) with the select <button> plus a sibling
+   remove <button> — buttons cannot nest, so the ✕ lives outside .nav-item.
+   A11y: opacity:0 keeps the button keyboard-focusable; Tab reveals it with a
+   focus ring, mouse reveals it on row hover. opacity:0 ≠ removed from Tab order. */
+.feed-item {
+  position: relative;
+}
+
+/* Reserve right space on the title row so an ellipsized title never slides
+   underneath the ✕ — a permanent reservation avoids text jumping on hover. */
+.feed-item .nav-row {
+  padding-right: 18px;
+}
+
+.nav-remove {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent; /* clear browser-default button styling */
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  opacity: 0; /* visually hidden by default, still focusable */
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.feed-item:hover .nav-remove {
+  opacity: 1;
+}
+
+.nav-remove:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.feed-item .nav-remove:hover {
+  background: var(--surface-soft);
+  color: var(--accent);
+}
+
+.feed-item.active .nav-remove {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.feed-item.active .nav-remove:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
 /* Feed-list placeholder states (loading / error / truly empty). Distinct from
    a real item so "loading" or "failed" is never shown as an empty feed list. */
 .nav-state {
