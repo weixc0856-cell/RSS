@@ -350,14 +350,17 @@ pub async fn process_source_job(user_id: &str, source_id: i64, url: &str, env: &
         Ok(parsed) => parsed,
         Err(error) => return Err(worker::Error::RustError(error.to_string())),
     };
-    let mut response = crate::feed::fetch_remote(&parsed).await?;
-    if !(200..300).contains(&response.status_code()) {
-        let message = format!("feed returned HTTP {}", response.status_code());
+    // Shared hardened fetch core (timeout / size cap / SSRF guard / redirect
+    // cap) — the same transport the legacy feeds pipeline uses.
+    let fetched = crate::feed::fetch_feed_document(&parsed, &[]).await?;
+    let status = fetched.status as i32;
+    if !(200..300).contains(&status) {
+        let message = format!("feed returned HTTP {status}");
         mark_source(user_id, source_id, "error", Some(&message), env).await?;
         return Err(worker::Error::RustError(message));
     }
 
-    let content = response.text().await?;
+    let content = fetched.body;
     let articles = match crate::feed::FeedParser::parse_rss(&content, source_id as i32) {
         Ok(articles) => articles,
         Err(error) => {

@@ -13,6 +13,9 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde", "js"] }
 md5 = "0.7"
+# Only used for the fetch-timeout race on wasm (future::select over Delay);
+# already in the lock as worker's transitive dep. No tokio "time".
+futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt"] }
 reqwest = { version = "0.11", features = ["json"] }
 quick-xml = { version = "0.37", features = ["escape-html"] }

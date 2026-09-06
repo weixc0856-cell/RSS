@@ -48,6 +48,126 @@ pub fn canonical_url(raw: &str) -> String {
     }
 }
 
+/// Lexical URL guard for outbound feed GETs, shared by both pipelines.
+///
+/// This is a cheap lexical-layer defense, NOT a complete SSRF prevention
+/// mechanism: a hostname that resolves to a private/loopback address is not
+/// visible here (DNS rebinding is not covered), and the Workers platform has
+/// its own outbound network boundary. It exists to reject the obvious mistakes
+/// before any bytes are requested: non-http(s) schemes, no host, literal
+/// local/internal names, and literal private/special-use IPs (including the
+/// cloud-metadata endpoint 169.254.169.254).
+///
+/// Namespace rules stay deliberately narrow — `localhost`/`.localhost`/
+/// `.local`/`.internal` only — rather than maintaining an ever-growing internal
+/// domain blacklist.
+pub(crate) fn is_safe_fetch_url(url: &url::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let lower = domain.to_ascii_lowercase();
+            !(lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower.ends_with(".local")
+                || lower.ends_with(".internal"))
+        }
+        Some(url::Host::Ipv4(addr)) => !is_unsafe_ipv4(&addr),
+        Some(url::Host::Ipv6(addr)) => !is_unsafe_ipv6(&addr),
+        None => false, // no host at all
+    }
+}
+
+fn is_unsafe_ipv4(addr: &std::net::Ipv4Addr) -> bool {
+    let o = addr.octets();
+    // 0.0.0.0/8 (unspecified / this-network).
+    if o[0] == 0 {
+        return true;
+    }
+    // 127.0.0.0/8 loopback.
+    if o[0] == 127 {
+        return true;
+    }
+    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 private.
+    if o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) {
+        return true;
+    }
+    // 169.254.0.0/16 link-local (covers the metadata endpoint).
+    if o[0] == 169 && o[1] == 254 {
+        return true;
+    }
+    // 100.64.0.0/10 shared address space (CGNAT).
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return true;
+    }
+    // 224.0.0.0/4 multicast.
+    if (224..=239).contains(&o[0]) {
+        return true;
+    }
+    // 240.0.0.0/4 reserved (includes 255.255.255.255 broadcast).
+    if o[0] >= 240 {
+        return true;
+    }
+    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 documentation.
+    if (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+    {
+        return true;
+    }
+    // 198.18.0.0/15 benchmarking.
+    if o[0] == 198 && (18..=19).contains(&o[1]) {
+        return true;
+    }
+    false
+}
+
+fn is_unsafe_ipv6(addr: &std::net::Ipv6Addr) -> bool {
+    // IPv4-mapped (::ffff:a.b.c.d) — evaluate the embedded IPv4.
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return is_unsafe_ipv4(&v4);
+    }
+    let seg = addr.segments();
+    // :: (unspecified) and ::1 (loopback).
+    if seg.iter().all(|&s| s == 0) || (seg[..7].iter().all(|&s| s == 0) && seg[7] == 1) {
+        return true;
+    }
+    // ff00::/8 multicast.
+    if seg[0] & 0xff00 == 0xff00 {
+        return true;
+    }
+    // fe80::/10 link-local.
+    if seg[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // fc00::/7 unique-local (ULA).
+    if seg[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    // 2001:db8::/32 documentation.
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return true;
+    }
+    false
+}
+
+/// Resolve a `Location` header against the URL it came from (absolute URL,
+/// protocol-relative `//host/path`, or root/relative path) into a fetchable
+/// URL. Returns `None` for an unusable target — empty, unjoinable, or not
+/// http(s).
+pub(crate) fn resolve_redirect(base: &url::Url, location: &str) -> Option<url::Url> {
+    if location.is_empty() {
+        return None;
+    }
+    let joined = base.join(location).ok()?;
+    if matches!(joined.scheme(), "http" | "https") {
+        Some(joined)
+    } else {
+        None
+    }
+}
+
 /// Normalize an RSS/Atom published timestamp to a canonical, chronologically
 /// sortable UTC ISO string `YYYY-MM-DDTHH:MM:SSZ`. The 20-char fixed shape is
 /// the sort contract for `ORDER BY published_at DESC` / `MAX(published_at)`:
@@ -336,6 +456,135 @@ mod tests {
             normalize_published_at("2026-09-02T12:00:00-05:00").as_deref(),
             Some("2026-09-02T17:00:00Z")
         );
+    }
+
+    fn assert_safe(raw: &str) {
+        let url = url::Url::parse(raw).unwrap_or_else(|e| panic!("parse {raw}: {e}"));
+        assert!(
+            is_safe_fetch_url(&url),
+            "{raw} should be fetchable under the lexical guard"
+        );
+    }
+
+    fn assert_unsafe(raw: &str) {
+        let url = url::Url::parse(raw).unwrap_or_else(|e| panic!("parse {raw}: {e}"));
+        assert!(
+            !is_safe_fetch_url(&url),
+            "{raw} should be rejected by the lexical guard"
+        );
+    }
+
+    /// Ordinary public hosts and non-private IPs pass the guard.
+    #[test]
+    fn is_safe_fetch_url_accepts_public_targets() {
+        assert_safe("https://example.com");
+        assert_safe("https://example.com:443/feed");
+        assert_safe("http://example.com/news/rss.xml");
+        // Public-ish IPv4 that happen to fall outside every rejected range
+        // (172.32.x is above 172.31, 100.128.x above 100.127).
+        assert_safe("http://172.32.0.1");
+        assert_safe("http://100.128.0.1");
+        // Public IPv6 (Cloudflare 1.1.1.1 over IPv6).
+        assert_safe("http://[2606:4700::1111]");
+    }
+
+    /// Loopback is rejected in both families, including the IPv4-mapped form.
+    #[test]
+    fn is_safe_fetch_url_rejects_loopback() {
+        assert_unsafe("http://127.0.0.1");
+        assert_unsafe("http://127.0.0.2");
+        assert_unsafe("http://[::1]");
+        assert_unsafe("http://[::ffff:127.0.0.1]");
+    }
+
+    #[test]
+    fn is_safe_fetch_url_rejects_private_ranges() {
+        assert_unsafe("http://10.0.0.1");
+        assert_unsafe("http://172.16.0.1");
+        assert_unsafe("http://172.31.255.255"); // top of 172.16/12
+        assert_unsafe("http://192.168.1.1");
+        assert_unsafe("http://[fc00::1]"); // ULA
+    }
+
+    #[test]
+    fn is_safe_fetch_url_rejects_link_local_and_metadata() {
+        assert_unsafe("http://169.254.169.254"); // cloud metadata endpoint
+        assert_unsafe("http://169.254.0.1");
+        assert_unsafe("http://[fe80::1]");
+    }
+
+    /// 100.64.0.0/10 shared address space (CGNAT) is not publicly routable.
+    #[test]
+    fn is_safe_fetch_url_rejects_shared_cgnat() {
+        assert_unsafe("http://100.64.0.1");
+        assert_unsafe("http://100.127.255.255");
+    }
+
+    #[test]
+    fn is_safe_fetch_url_rejects_special_use_ranges() {
+        assert_unsafe("http://0.0.0.0"); // unspecified
+        assert_unsafe("http://224.0.0.1"); // multicast
+        assert_unsafe("http://255.255.255.255"); // broadcast / reserved
+        assert_unsafe("http://192.0.2.1"); // documentation
+        assert_unsafe("http://198.51.100.1"); // documentation
+        assert_unsafe("http://203.0.113.1"); // documentation
+        assert_unsafe("http://198.18.0.1"); // benchmarking
+        assert_unsafe("http://[::]"); // IPv6 unspecified
+        assert_unsafe("http://[2001:db8::1]"); // IPv6 documentation
+        assert_unsafe("http://[ff02::1]"); // IPv6 multicast
+    }
+
+    /// Local/internal naming is rejected lexically; genuinely public DNS names
+    /// are left for DNS resolution (a resolution-time check is out of scope).
+    #[test]
+    fn is_safe_fetch_url_rejects_internal_names() {
+        assert_unsafe("http://localhost");
+        assert_unsafe("http://localhost:8080/feed");
+        assert_unsafe("http://foo.localhost");
+        assert_unsafe("http://host.internal");
+        assert_unsafe("http://printer.local");
+    }
+
+    #[test]
+    fn is_safe_fetch_url_rejects_non_http_schemes_and_hostless() {
+        assert_unsafe("ftp://example.com/file.xml");
+        assert_unsafe("file:///etc/passwd");
+        assert_unsafe("mailto:user@example.com");
+    }
+
+    /// Location resolution covers absolute, root-relative, protocol-relative and
+    /// path-relative forms, and refuses anything that is not http(s).
+    #[test]
+    fn resolve_redirect_resolves_and_filters_targets() {
+        let base = url::Url::parse("https://example.com/dir/feed.xml").unwrap();
+
+        // Absolute URL.
+        let abs = resolve_redirect(&base, "https://cdn.example.net/rss.xml").unwrap();
+        assert_eq!(abs.as_str(), "https://cdn.example.net/rss.xml");
+
+        // Root-relative.
+        let root = resolve_redirect(&base, "/rss").unwrap();
+        assert_eq!(root.as_str(), "https://example.com/rss");
+
+        // Protocol-relative.
+        let proto = resolve_redirect(&base, "//other.example.com/x").unwrap();
+        assert_eq!(proto.as_str(), "https://other.example.com/x");
+
+        // Path-relative with dot-segments resolved.
+        let rel = resolve_redirect(&base, "../x").unwrap();
+        assert_eq!(rel.as_str(), "https://example.com/x");
+
+        // Query-only keeps the path.
+        let q = resolve_redirect(&base, "?page=2").unwrap();
+        assert_eq!(q.as_str(), "https://example.com/dir/feed.xml?page=2");
+
+        // Non-http(s) targets are refused (this is what keeps a manual redirect
+        // loop from following a `Location: file:///…`).
+        assert!(resolve_redirect(&base, "ftp://bad.example.com/f").is_none());
+        assert!(resolve_redirect(&base, "file:///etc/passwd").is_none());
+
+        // Empty Location is terminal (no target).
+        assert!(resolve_redirect(&base, "").is_none());
     }
 }
 

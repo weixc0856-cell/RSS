@@ -3,25 +3,37 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use url::Url;
 use worker::d1::D1Type;
-use worker::{console_error, console_log, Error, Env, Fetch, Headers, Method, Request, RequestInit, Result};
+use worker::{
+    console_error, console_log, Error, Env, Fetch, Headers, Method, Request, RequestInit,
+    RequestRedirect, Result,
+};
 
 /// Cap per-fetch inserts so a single Worker invocation stays within
 /// per-request limits (e.g. subrequests / D1 API calls on the free plan).
 const MAX_ARTICLES_PER_FETCH: usize = 25;
 
+/// Max redirect hops `fetch_feed_document` will follow manually.
+const MAX_REDIRECTS: usize = 5;
+/// Post-buffering validation limit, NOT a hard memory cap: worker-rs 0.8.5 body
+/// reads are fully buffered (`Response::text()` buffers before any length can be
+/// checked), so this bounds what reaches the XML parser / D1 pipeline, not peak
+/// read memory.
+const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
+/// Response-time deadline per HTTP hop — a deadline, not a guaranteed
+/// cancellation of the underlying outbound request (see `race_timeout`).
+const FETCH_TIMEOUT_SECS: u64 = 20;
+
 pub struct FeedParser;
 
 impl FeedParser {
     pub async fn fetch_feed(url: &str) -> Result<Vec<Article>> {
-        let mut response =
-            fetch_with_ua(&Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?, &[])
-                .await?;
-        if !(200..300).contains(&response.status_code()) {
-            return Err(Error::RustError(format!("feed returned HTTP {}", response.status_code())));
+        let parsed = Url::parse(url).map_err(|error| Error::RustError(error.to_string()))?;
+        let fetched = fetch_feed_document(&parsed, &[]).await?;
+        if !(200..300).contains(&fetched.status) {
+            return Err(Error::RustError(format!("feed returned HTTP {}", fetched.status)));
         }
 
-        let content = response.text().await?;
-        parse_document(&content, 0)
+        parse_document(&fetched.body, 0)
     }
 
     pub fn parse_rss(content: &str, feed_id: i32) -> Result<Vec<Article>> {
@@ -46,15 +58,25 @@ fn d1_text_or_null(value: &Option<String>) -> D1Type<'_> {
     }
 }
 
-/// Shared outbound HTTP helper (browser-like UA). Used by the legacy feed
-/// pipeline and the user-scoped `rss_sources` pipeline.
-pub(crate) async fn fetch_remote(url: &Url) -> Result<worker::Response> {
-    fetch_with_ua(url, &[]).await
+/// Result of a hardened outbound feed GET.
+///
+/// `body` is populated only for successful 2xx responses; non-2xx responses may
+/// carry an empty body (a 304 is always empty and must never be parsed as if it
+/// were an empty feed).
+pub(crate) struct FetchedFeed {
+    pub(crate) status: u16,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) body: String,
 }
 
-/// Send an outbound GET for a feed with a browser-like `User-Agent`, which a
-/// number of publishers use to decide whether to serve RSS or block bots.
-async fn fetch_with_ua(url: &Url, extra: &[(&str, &str)]) -> Result<worker::Response> {
+/// One outbound GET for a feed with a browser-like `User-Agent` (a number of
+/// publishers use it to decide whether to serve RSS or block bots). Redirects
+/// are NOT followed by the runtime (`RequestRedirect::Manual`): each hop is
+/// re-validated against the SSRF guard by `fetch_feed_document`. `extra`
+/// carries the conditional-GET validators and is re-sent on every hop — the
+/// same effect runtime "follow" mode had on them.
+async fn send_once(url: &Url, extra: &[(&str, &str)]) -> Result<worker::Response> {
     let mut headers = Headers::new();
     headers.set(
         "User-Agent",
@@ -66,8 +88,151 @@ async fn fetch_with_ua(url: &Url, extra: &[(&str, &str)]) -> Result<worker::Resp
 
     let mut init = RequestInit::new();
     init.with_method(Method::Get).with_headers(headers);
+    init.with_redirect(RequestRedirect::Manual);
     let request = Request::new_with_init(url.as_str(), &init)?;
     Fetch::Request(request).send().await
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn response_header(response: &worker::Response, name: &str) -> Option<String> {
+    response.headers().get(name).ok().flatten()
+}
+
+/// Shared outbound feed-GET core used by the legacy `feeds` pipeline and the
+/// user-scoped `rss_sources` pipeline. Transport hardening only — the HTTP
+/// status mapping, 304 semantics and error messages the callers rely on are
+/// unchanged; this adds a timeout, a response-size cap, a lexical SSRF guard
+/// and a redirect cap.
+///
+/// Redirect hops are followed manually and EVERY hop (starting URL included) is
+/// re-checked against the SSRF guard — the real risk is
+/// `https://trusted/feed -> 302 Location: http://127.0.0.1`, not the original
+/// URL. The response body is read at most once, and only after the final
+/// response has been classified as a successful 2xx response; 304 and other
+/// non-2xx responses are returned with an empty body for the caller to act on.
+pub(crate) async fn fetch_feed_document(
+    url: &Url,
+    extra: &[(&str, &str)],
+) -> Result<FetchedFeed> {
+    if !crate::utils::is_safe_fetch_url(url) {
+        return Err(Error::RustError(format!("blocked unsafe fetch URL: {url}")));
+    }
+
+    let mut current = url.clone();
+    let mut redirects = 0usize;
+
+    loop {
+        let mut response = race_timeout(send_once(&current, extra), FETCH_TIMEOUT_SECS).await?;
+        let status = response.status_code();
+
+        if is_redirect_status(status) {
+            let location = response_header(&response, "location").filter(|v| !v.is_empty());
+            let next =
+                match location.and_then(|loc| crate::utils::resolve_redirect(&current, &loc)) {
+                    Some(next) => next,
+                    None => {
+                        // Redirect without a usable Location is a terminal
+                        // non-2xx response and follows the existing HTTP error
+                        // path (the caller sees a non-2xx status, empty body).
+                        return Ok(FetchedFeed {
+                            status,
+                            etag: None,
+                            last_modified: None,
+                            body: String::new(),
+                        });
+                    }
+                };
+            if redirects >= MAX_REDIRECTS {
+                return Err(Error::RustError(format!(
+                    "feed redirect limit exceeded ({MAX_REDIRECTS}) from {url}"
+                )));
+            }
+            if !crate::utils::is_safe_fetch_url(&next) {
+                return Err(Error::RustError(format!(
+                    "blocked unsafe redirect target: {next}"
+                )));
+            }
+            redirects += 1;
+            console_log!(
+                "[feed] redirect {status} -> {next} (hop {redirects}/{MAX_REDIRECTS})"
+            );
+            current = next;
+            continue;
+        }
+
+        let etag = response_header(&response, "etag").filter(|v| !v.is_empty());
+        let last_modified = response_header(&response, "last-modified").filter(|v| !v.is_empty());
+
+        // Content-Length pre-check (advisory — the authoritative cap is the
+        // post-read `body.len()` check below).
+        if let Some(raw) = response_header(&response, "content-length") {
+            if let Ok(len) = raw.parse::<usize>() {
+                if len > MAX_FEED_BYTES {
+                    return Err(Error::RustError(format!(
+                        "feed response too large: Content-Length {len} exceeds {MAX_FEED_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+
+        if !(200..300).contains(&status) {
+            // 304 / other non-2xx: never read the body.
+            return Ok(FetchedFeed {
+                status,
+                etag,
+                last_modified,
+                body: String::new(),
+            });
+        }
+
+        let body = race_timeout(response.text(), FETCH_TIMEOUT_SECS).await?;
+        if body.len() > MAX_FEED_BYTES {
+            return Err(Error::RustError(format!(
+                "feed response too large: {} bytes exceeds {MAX_FEED_BYTES} bytes",
+                body.len()
+            )));
+        }
+        return Ok(FetchedFeed {
+            status,
+            etag,
+            last_modified,
+            body,
+        });
+    }
+}
+
+/// Race `fut` against a `secs`-second deadline.
+///
+/// A response-time deadline, NOT a guaranteed cancellation of the underlying
+/// outbound request: on the wasm Worker the in-flight fetch future is dropped
+/// (its JS promise released) rather than hard-aborted, because worker-rs 0.8.5
+/// `RequestInit` exposes no signal/timeout field. `worker::Delay` is `!Unpin`,
+/// so both race branches must be pinned. On the native host the timer is
+/// compiled out (no real outbound fetch path is exercised under `cargo test`).
+async fn race_timeout<F, T>(fut: F, secs: u64) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        use futures_util::future::{select, Either};
+        let work = Box::pin(fut);
+        let timer = Box::pin(worker::Delay::from(std::time::Duration::from_secs(secs)));
+        match select(work, timer).await {
+            Either::Left((outcome, _timer)) => outcome,
+            Either::Right(((), _work)) => Err(Error::RustError(format!(
+                "feed fetch timed out after {secs}s"
+            ))),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = secs;
+        fut.await
+    }
 }
 
 const DEFAULT_FETCH_INTERVAL_MINUTES: i64 = 15;
@@ -77,10 +242,6 @@ fn backoff_minutes(interval: i64, consecutive_failures: i64) -> i64 {
     let shift = consecutive_failures.clamp(0, 6) as u32;
     let base = interval.max(5);
     (base * 2i64.pow(shift)).min(MAX_BACKOFF_MINUTES)
-}
-
-fn response_header(response: &worker::Response, name: &str) -> Option<String> {
-    response.headers().get(name).ok().flatten()
 }
 
 pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
@@ -121,12 +282,12 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
         }
     }
 
-    let mut response = fetch_with_ua(
+    let fetched = fetch_feed_document(
         &Url::parse(url).map_err(|e| Error::RustError(e.to_string()))?,
         &conditional,
     )
     .await?;
-    let status = response.status_code() as i32;
+    let status = fetched.status as i32;
 
     // 304 Not Modified => content unchanged; counts as success (fresh), no
     // parsing. Re-store the validators we just sent: the origin did not give us
@@ -154,11 +315,11 @@ pub async fn fetch_feed(url: &str, env: &Env) -> Result<usize> {
         return Err(Error::RustError(message));
     }
 
-    let new_etag = response_header(&response, "etag").filter(|v| !v.is_empty());
-    let new_last_modified = response_header(&response, "last-modified").filter(|v| !v.is_empty());
+    let new_etag = fetched.etag.filter(|v| !v.is_empty());
+    let new_last_modified = fetched.last_modified.filter(|v| !v.is_empty());
 
     let before = count_articles(&db, feed_id).await?;
-    let content = response.text().await?;
+    let content = fetched.body;
     let articles = match parse_document(&content, feed_id) {
         Ok(articles) => articles,
         Err(error) => {
@@ -831,6 +992,19 @@ mod tests {
             d1_text_or_null(&Some("hello".to_string())),
             D1Type::Text("hello")
         ));
+    }
+
+    /// Only the redirect statuses the manual loop follows (301/302/303/307/308)
+    /// count as redirects. 300 is Multiple Choices (no automatic follow),
+    /// 304 is a terminal Not Modified, and everything else is a normal outcome.
+    #[test]
+    fn is_redirect_status_classifies_status_codes() {
+        for status in [301u16, 302, 303, 307, 308] {
+            assert!(is_redirect_status(status), "{status} must be a redirect");
+        }
+        for status in [200u16, 201, 204, 300, 304, 400, 404, 410, 500, 503] {
+            assert!(!is_redirect_status(status), "{status} must NOT be a redirect");
+        }
     }
 
 }
