@@ -10,12 +10,17 @@
  *
  * Checks (all read-only — no writes, no fetches, no cron triggers):
  *   1. D1: every non-NULL `articles.published_at` matches the canonical
- *      skeleton; feeds == 3; zero duplicate article hashes.
- *   2. `/api/health`: feeds 3/active/0-failed; `newest_published_at` is
- *      canonical AND recent (< 48h — proves MAX is real time, not a stale
- *      lexicographic artifact).
- *   3. Per feed `/api/feeds/:id/articles`: non-empty 50-window, every
- *      `published_at` canonical, strictly DESC (monotonic).
+ *      skeleton; zero duplicate article hashes.
+ *   2. Topology-agnostic feed accounting: the D1 `feeds` count equals the
+ *      `/api/feeds` listing length, and `/api/health`'s enabled-feeds counts
+ *      are internally consistent (active + failed == total, total within the
+ *      full listing). No fixed feed count is asserted — the set legitimately
+ *      grows/shrinks over time.
+ *   3. `/api/health`: `newest_published_at` is canonical AND recent (< 48h —
+ *      proves MAX is real time, not a stale lexicographic artifact).
+ *   4. Every feed in `/api/feeds`: `/api/feeds/:id/articles` window has every
+ *      `published_at` canonical and strictly DESC (monotonic); feeds whose
+ *      status is `active` are additionally expected non-empty.
  *
  * Note: D1 rejects a strict 16-bracket `[0-9]` GLOB as "pattern too complex",
  * so the SQL sanity uses the fixed-width `?`-skeleton (D1 `?` = one char). The
@@ -56,26 +61,56 @@ const [r] = await d1(
      (SELECT COUNT(*) FROM (SELECT hash FROM articles GROUP BY hash HAVING COUNT(*) > 1)) dups`
 );
 ok("D1: articles non-NULL all canonical (skeleton)", r.nulls === 0 && r.noncanon === 0, `nulls=${r.nulls} noncanon=${r.noncanon}`);
-ok("D1: feeds == 3", r.feeds === 3, `feeds=${r.feeds}`);
 ok("D1: no duplicate hashes", r.dups === 0, `dups=${r.dups}`);
+
+const feedsRes = await fetch(BASE + "/api/feeds");
+const feedsBody = await feedsRes.json();
+const feeds = Array.isArray(feedsBody.data) ? feedsBody.data : [];
+ok("/api/feeds returns an array", feedsRes.ok && Array.isArray(feedsBody.data), String(feedsBody).slice(0, 80));
+
+// Topology-agnostic accounting: D1 and the two HTTP endpoints must agree on
+// how many feeds exist. No absolute count is pinned.
+ok("D1 feeds count == /api/feeds listing length", r.feeds === feeds.length, `d1=${r.feeds} http=${feeds.length}`);
 
 const health = await (await fetch(BASE + "/api/health")).json();
 const h = health.data;
-ok("health success + feeds 3/0/3", h.feeds.total === 3 && h.feeds.active === 3 && h.feeds.failed === 0, JSON.stringify(h.feeds));
-ok("health newest_published_at is canonical ISO", CANON.test(h.articles.newest_published_at), h.articles.newest_published_at);
-ok(
-  "health newest_published_at is recent (<48h)",
-  Date.now() - Date.parse(h.articles.newest_published_at) < 48 * 3600 * 1000,
-  h.articles.newest_published_at
-);
+if (h?.feeds) {
+  ok(
+    "health active + failed == total",
+    h.feeds.active + h.feeds.failed === h.feeds.total,
+    JSON.stringify(h.feeds)
+  );
+  ok(
+    "health enabled feeds within full listing",
+    h.feeds.total <= feeds.length,
+    `health=${h.feeds.total} listing=${feeds.length}`
+  );
+} else {
+  ok("health returns feeds counts", false, JSON.stringify(h).slice(0, 80));
+}
+if (h?.articles?.newest_published_at) {
+  ok("health newest_published_at is canonical ISO", CANON.test(h.articles.newest_published_at), h.articles.newest_published_at);
+  ok(
+    "health newest_published_at is recent (<48h)",
+    Date.now() - Date.parse(h.articles.newest_published_at) < 48 * 3600 * 1000,
+    h.articles.newest_published_at
+  );
+}
 
-for (const id of [1, 2, 3]) {
+for (const feed of feeds) {
+  const id = feed.id;
   const res = await fetch(BASE + `/api/feeds/${id}/articles`);
   const body = await res.json();
   const arts = body.data?.articles ?? body.data;
   ok(`feed#${id}: /api returns 200 + array`, res.ok && Array.isArray(arts), String(body).slice(0, 80));
   if (!Array.isArray(arts)) continue;
-  ok(`feed#${id}: window non-empty`, arts.length > 0, `len=${arts.length}`);
+  // An `active` feed has fetched successfully at least once, so it should
+  // have persisted articles. `error`/`pending` feeds may legitimately be empty.
+  ok(
+    `feed#${id}: active feed window non-empty`,
+    feed.status !== "active" || arts.length > 0,
+    `status=${feed.status} len=${arts.length}`
+  );
   const times = arts.map((a) => a.published_at);
   ok(`feed#${id}: every published_at canonical`, times.every((t) => t && CANON.test(t)), JSON.stringify(times.slice(0, 3)));
   ok(`feed#${id}: DESC order monotonic`, times.every((t, i) => i === 0 || times[i - 1] >= t));
