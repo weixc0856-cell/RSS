@@ -33,6 +33,20 @@ Checks (assertive, exits non-zero on failure):
   (empty for a brand-new key — the first call provisions one benign profile
   row), while an anonymous request answers a structured 400.
 
+### WS7 device-isolation drill (mutates — dev only)
+Run: `node scripts/ws7-device-drill.mjs` (defaults to the dev worker URL)
+
+Scripted equivalent of the prod incognito check: drives two fake devices (A/B)
+through the full subscription lifecycle against the shared pool — anonymous 400,
+empty start (no cross-device sync), add-form subscribe (`created:true`),
+Discover subscribe (`POST /:id/subscribe`, idempotent), re-add convergence
+(`already:true`), shared vs last-user unsubscribe (`pruned:false` / `pruned:true`
++ pool prune), structured 404 for a non-subscriber. **Mutates the pool** (creates
++ prunes one drill feed) and provisions two idempotent profile rows; refuses the
+production host unless `WS7_DRILL_ALLOW_PROD=1`. Self-cleaning: a preamble
+clears any leftover drill feed from a crashed prior run and the drill asserts the
+pool returns to its pre-run snapshot, so it is safe to re-run.
+
 ## 3. Performance sampling
 Run: `pwsh scripts/test-perf.ps1 -Base <url> -Iterations 30`
 
