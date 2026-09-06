@@ -15,9 +15,15 @@
  *      `/api/feeds` listing length, and `/api/health`'s enabled-feeds counts
  *      are internally consistent (active + failed == total, total within the
  *      full listing). No fixed feed count is asserted — the set legitimately
- *      grows/shrinks over time.
+ *      grows/shrinks over time. `/api/feeds` is the SHARED-POOL catalog
+ *      (Discover-only under the WS7 device model), NOT a per-device view — the
+ *      whole-pool == D1 feeds equation is exactly why this script must keep
+ *      reading the pool catalog and never the per-device `/api/me/feeds`.
  *   3. `/api/health`: `newest_published_at` is canonical AND recent (< 48h —
- *      proves MAX is real time, not a stale lexicographic artifact).
+ *      proves MAX is real time, not a stale lexicographic artifact). Under the
+ *      subscription gate (WS7) this stays true only while >=1 device subscribes
+ *      to a pool feed and the cron has run since — see the WS7 acceptance note
+ *      in PRODUCTION_BASELINE.md.
  *   4. Every feed in `/api/feeds`: `/api/feeds/:id/articles` window has every
  *      `published_at` canonical and strictly DESC (monotonic); feeds whose
  *      status is `active` are additionally expected non-empty.

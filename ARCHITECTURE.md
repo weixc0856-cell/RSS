@@ -80,6 +80,43 @@ rss-worker (rss-worker.weixc0856.workers.dev)  →  D1 rss-db-dev   （默认/�
   避免回填后旧 Worker 又写回原文）。JS 回填输出与 Rust 输出字节一致（自检表锁 Rust 单测值）。
 - code review：把 feed 原文直接写入 `published_at`（绕过归一化）视为违约。
 
+### 3.2 设备模型：每设备一份订阅列表 + 共享池（WS7，2026-09-06）
+
+**方向反转声明**：WS1 曾把 `DELETE /api/feeds/:id` 定为**全局删除**、WS6 的 ✕ 文案写
+「shared catalog」——WS7 **有意反转二者为「设备退订」**，是新决策而非回归（见 §7 WS7）。
+用户需求：其他设备访问不应是共享的同一批默认源；每设备各自一份列表、**可独立增删**。
+
+- **共享池不变**：`feeds`/`articles` 仍是唯一的全局数据平面（一个源一次抓取、所有订阅者读
+  同一批文章）。**不引入按设备的文章桶**。`subscriptions`（001 已存在）把
+  `user_id → feed_id` 挂到池上；`UNIQUE(user_id, feed_id)` 保证幂等。
+- **`profiles` = 匿名设备命名空间注册表（anonymous device namespace registry），不是用户/
+  账户表**（migration 007）。它把浏览器随机 key（`X-User-Id` 头）稳定映射成
+  `subscriptions.user_id` 需要的 INTEGER，纯命名空间用途：无鉴权、无账户生命周期、无
+  device management、行从不删除。保留它是**有意设计**（历史 `user_id INTEGER` 免改列型；
+  未来若真加 authentication 可在其上再叠账户层），但绝不命名/注释成 users。
+- **`X-User-Id` 是 device namespace identifier —— ≠ authentication，≠ authorization**：
+  128-bit 随机 UUID 只意味着「不同浏览器随机生成发生碰撞的概率极低」，**不意味着不可伪造**；
+  任何人可发 `X-User-Id: abc`，若知道他人 key 即进入对应 namespace。这是隔离到浏览器粒度的
+  **命名空间隔离，不是安全边界**。此措辞在 ARCHITECTURE/`src/identity.rs`/migration 007
+  注释统一。前端 localStorage key = `rss_device_key`（`crypto.randomUUID` + 非安全上下文回退；
+  localStorage 被禁时退化为会话内存 key，刷新即新设备，可接受）。
+- **API 双面（不变式）**：`GET /api/feeds` = 共享池目录，**Discover-only** —— 前端「我的列表」
+  导航**绝不允许**从它派生；`GET /api/me/feeds`（需 X-User-Id）= 本设备列表，
+  **navigation-only**，返回与 `list_feeds` **同一 17 列投影**（共享 `FEED_PROJECTION` 常量）
+  + `subscribed_at` + `article_count`（投影漂移会静默劣化导航健康徽标）。缺头 → 400
+  `X-User-Id header required`。
+- **池状态机**：某源订阅数 0 = **dormant**（不抓取、Discover 仍可见、留在池）；≥1 = **active**
+  （一次抓取共享文章）；最后一个订阅者退订 → 该源 feed + 全部文章**从池 prune**（显式删序
+  先 articles 后 feeds，不依赖 D1 FK pragma）。
+- **抓取双门**：scheduler 只选「有 ≥1 订阅」的 due feed（§5）；消费端 `fetch_feed(url, env)`
+  执行前第一步 feed 查找 SELECT 同时要求 `EXISTS(subscription)`（feed 被删即查不到、出网前
+  短路），并在解析成功、落库前**再复查一次**订阅存在（封住出网那几秒内被 prune 的孤儿
+  窗口；0 订阅则跳过落库返回 `Ok(0)`，不动已删行）。不做事务/reconcile（评审认可的边界）。
+- **添加 = find-or-create + 订到本设备，幂等全成功**：URL 规范化查池 → 池无 → 建源 + 订阅 +
+  初始抓取 enqueue（先订阅后 enqueue，保证执行门通过）；池有且本设备未订 → 静默订阅；已订 →
+  no-op。全分支 `success:true`，data = `{feed, created, already}`。**✕ = 退订本设备**
+  （返回 `{id, pruned}`）；`POST /api/feeds/:id/subscribe` = Discover「+」幂等订阅既有池源。
+
 ## 4. Feed 健康与抓取治理（schema 005）
 
 `feeds` 新增：`normalized_url / enabled / fetch_interval_minutes / last_success_at /
@@ -110,6 +147,9 @@ last_modified`。
 - Cron（`*/15 * * * *`）只唤醒 Scheduler。
 - Scheduler 按 `enabled=1 AND (next_fetch_at IS NULL OR next_fetch_at<=now())` 选择到期 feed，
   不再无条件全量抓取。
+- **订阅门（WS7）**：选择条件追加 `EXISTS (SELECT 1 FROM subscriptions s WHERE
+  s.feed_id = f.id)` —— 0 订阅的池源是 dormant，不入队不抓取（Discover 仍可见）；
+  消费端另有执行门双保险（§3.2）。
 - 每条 job 携带 `run_id`；消息以 JSON 字符串发送（避免 workers-rs 对象字段丢失的坑），
   消费端 `normalize_body()` 兼容对象/字符串两种投递形态。
 - **Queue payload 契约（v1）**：job 携带 `version: 1` + `type`（`feed_fetch` / `source_fetch`）。
@@ -145,9 +185,12 @@ last_modified`。
   有 `Origin` 且命中 → 回显该 origin；无 `Origin`（curl、Worker 内部 scheduler/queue）或
   未命中 → 不设 `Access-Control-Allow-Origin`。**CORS 是浏览器访问控制，不是 API 认证**：
   服务端/curl 调用不受影响，`is_allowed_origin` 单测覆盖前缀/端口/宿主绕过负例。
-- `Access-Control-Allow-Headers: Content-Type`、
+- `Access-Control-Allow-Headers: Content-Type, X-User-Id`、
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`、`Max-Age: 86400`。
-  源层身份头 `X-User-Id` 已随 `/api/sources` 退休摘除（见 §7 WS5）—— 无端点读取它，不再在 CORS 广告。
+  WS5 曾随 `/api/sources` 退休把 `X-User-Id` 从 CORS 摘除（当时无端点读它）；WS7 为设备
+  命名空间**重新宣告** `X-User-Id`（`/api/me/feeds`、POST `/api/feeds`、subscribe、
+  DELETE 均读它）—— 自定义头使每个请求都走预检，漏宣告则整站 CORS 挂（functional 测试
+  有断言）。
 - **API 错误 ≠ 空数组**：`list_feeds`/列表类错误路径返回 500，不伪装成 `[]`；真空表返回的
   `[]` 是真“空”，前端据此区分“错误（可重试）”与“无数据”。
 
@@ -243,6 +286,49 @@ last_modified`。
     历史行停止刷新）；生产 `check-articles-contract.mjs` 全 PASS；OPTIONS 预检
     `Allow-Headers` 仅 `Content-Type`。
   - 部署：生产 `rss-worker-production` v`ae54114e`、dev `rss-worker` v`1f6d1a8f`。
+
+- [x] **WS7 设备模型（2026-09-06）**：每设备一份订阅列表 + 共享 feeds/articles 池（§3.2）。
+  方向反转声明：WS1 的「全局删除」与 WS6 的「shared catalog ✕ 文案」在此**有意反转**为
+  「设备退订」—— WS6 的 ✕ 交互链路（hover/键盘可达、能加→能看→能删）全部保留，只改语义
+  与文案。三 commit：A `e61a4b5`（worker+schema）→ B `443a588`（frontend）→ C（scripts/
+  docs，本记录所在 commit）。各 commit 均过 Gate 1：native **73 tests**（WS5 的 71 − 2
+  删 Subscription/SubscribeFeedRequest serde + 4 增 identity）、wasm `cargo check --tests`、
+  前端 build+typecheck、死臂净零 grep（`handle_get_user_feeds`/`handle_subscribe_feed`/
+  `handle_unsubscribe_feed`、`Subscription`/`SubscribeFeedRequest` 全仓零残留）。
+  - **schema**：`migrations/007_device_profiles.sql` —— `profiles` = 匿名设备命名空间
+    注册表（`device_key` UNIQUE → INTEGER id）。非用户/账户表、无鉴权；行从不删除。生产
+    subscriptions 现为 0 行，007 无需回填。**上线先 apply 007 再部署 worker**（否则引用
+    不存在的表）。
+  - **worker**：`src/identity.rs`（`normalize_device_key` ≤128 字节 abuse guard +
+    `require_profile` 按 key 查/插 profiles，唯一键竞态重试一次）；routes 抽
+    `FEED_PROJECTION` 常量供 list_feeds 与 `handle_get_my_feeds` 共用同投影；POST
+    `/api/feeds` 翻转为幂等 find-or-create + 订到本设备（`{feed, created, already}` 全成功）；
+    新增 `GET /api/me/feeds`（navigation-only）与 `POST /api/feeds/:id/subscribe`；
+    DELETE 翻转为退订 + 最后订阅者 prune（404 统一结构化 `json_error`，不泄露他人成员）。
+    scheduler due-feed SELECT 加 `EXISTS(subscriptions)` 门；`feed.rs::fetch_feed` 执行门 ×2
+    （feed 查找并入订阅 EXISTS、落库前复查，0 订阅 → `Ok(0)` 跳过）。lib.rs 移除三条 501
+    死臂、CORS 重宣告 `X-User-Id`。
+  - **frontend**：api.ts `getDeviceKey`（localStorage `rss_device_key` + `crypto.randomUUID`
+    回退 + try/catch）+ 每请求带 `X-User-Id`；`getFeeds()` 钉死 **Discover-only**、新
+    `getMyFeeds()` 供导航、`subscribeFeed`；`addFeed`→`AddFeedResult`、`deleteFeed`→
+    `DeleteResult{id,pruned}`。app.ts 导航读 my 列表、池目录渲染 Discover「+」条（点才订阅，
+    列表恒空也不自动加）；统计改为**本设备** active/failed/articles（`article_count` 求和），
+    不再拿池全局计数当本设备数字；✕ 退订文案不承诺清池、toast 按 `pruned` 分流；空态文案
+    引导 Discover。
+  - **scripts/docs**：functional 测试加两条只读断言（OPTIONS 预检 `Allow-Headers` 含
+    `X-User-Id`；`GET /api/me/feeds` 固定 key → success+数组、匿名 → 400）；契约脚本零
+    功能改动仅注释（`/api/feeds` 仍全池、Discover-only，feeds==D1 等式不变）；TESTING.md
+    期望数 71→73、§2 加新检查、§6 「feeds=3」改动态比对 + WS7 订阅门说明；
+    PRODUCTION_BASELINE.md supersede 三段过时的「DELETE stub」行 + WS7 验收快照块（Gate 2
+    回填）；public/index.html 补新端点 + `X-User-Id` 语义注。
+  - **模型语义**：`X-User-Id` = 设备命名空间 id（≠鉴权 ≠授权，碰撞极低 ≠ 不可伪造），
+    措辞在 ARCHITECTURE/`identity.rs`/migration 注释统一；`/api/feeds` Discover-only /
+    `/api/me/feeds` navigation-only 不变式、池状态机（0 订阅 dormant / ≥1 active）、双门抓取
+    均写入 §3.2/§5。
+  - **Gate 2（部署验收，待回填）**：dev 先行（apply 007 → 迁移门 → 部署 → 双假设备隔离演练
+    → functional/perf）后 prod 按评审 #9 顺序（apply 007 → worker 部署 → **紧邻** Pages →
+    **立即**真实浏览器订阅保留源 → 等 cron → 契约脚本 → 隐身第二设备验隔离）。结果与
+    Discover 源数快照记入 `PRODUCTION_BASELINE.md`「WS7 设备模型」。
 
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 

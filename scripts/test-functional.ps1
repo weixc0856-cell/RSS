@@ -80,6 +80,51 @@ foreach ($probe in @(@{ Method = "GET"; Path = "/api/sources"; Body = $null },
     }
 }
 
+# 5. WS7 device model, read-only:
+#   (a) CORS preflight must re-advertise X-User-Id — the custom header makes
+#       every request preflight, so an Allow-Headers that omits it kills the
+#       whole site under the browser.
+#   (b) GET /api/me/feeds is identity-required: a fixed device key gets a
+#       success:true array (empty for a brand-new key — read-only, no
+#       subscribe/delete round-trips that would mutate the pool), while an
+#       anonymous request gets a structured 400. The first me-call provisions
+#       one profile row for the demo key (benign, idempotent).
+$pre = $null
+try {
+    $pre = Invoke-WebRequest -Uri ($Base + "/api/feeds") -Method Options `
+        -Headers @{
+            "Origin"                         = "https://rss-intelligence.pages.dev"
+            "Access-Control-Request-Method"  = "GET"
+            "Access-Control-Request-Headers" = "content-type, x-user-id"
+        } -UseBasicParsing -TimeoutSec $Timeout
+}
+catch { $pre = $_.Exception.Response }
+Check "OPTIONS preflight reachable" ($null -ne $pre) "got $($pre.StatusCode)"
+if ($null -ne $pre) {
+    $allowHeaders = ""
+    try { $allowHeaders = [string]$pre.Headers["Access-Control-Allow-Headers"] } catch {}
+    Check "preflight Allow-Headers includes X-User-Id" ($allowHeaders -match "X-User-Id") "got: $allowHeaders"
+}
+
+$me = (Call-Json "/api/me/feeds" "functional-demo-device").Content | ConvertFrom-Json
+Check "GET /api/me/feeds with device key success + array" ($me.success -eq $true -and $me.data -is [array]) "success=$($me.success)"
+
+# Anonymous /api/me/feeds must answer a structured 400, not a 2xx.
+$anonStatus = 0; $anonBody = $null
+try {
+    $resp = Invoke-WebRequest -Uri ($Base + "/api/me/feeds") -Method GET -UseBasicParsing -TimeoutSec $Timeout
+    $anonStatus = $resp.StatusCode; $anonBody = $resp.Content
+}
+catch {
+    $anonStatus = [int]$_.Exception.Response.StatusCode
+    try { $anonBody = $_.ErrorDetails.Message } catch {}
+}
+Check "GET /api/me/feeds anonymous == 400" ($anonStatus -eq 400) "got $anonStatus"
+if ($anonBody) {
+    $j = $anonBody | ConvertFrom-Json
+    Check "GET /api/me/feeds anonymous success=false" ($j.success -eq $false)
+}
+
 Write-Host ""
 if ($script:fails -gt 0) {
     Write-Host "RESULT: $($script:fails) check(s) FAILED"

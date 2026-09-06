@@ -92,6 +92,27 @@
             color: white;
         }
 
+        .endpoint small {
+            color: #888;
+            font-size: 0.8em;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .api-note {
+            margin: 10px 0 0;
+            padding-top: 10px;
+            border-top: 1px solid #ddd;
+            color: #666;
+            font-size: 0.9em;
+            text-align: left;
+        }
+
+        .api-note code {
+            background: #e8e8e8;
+            padding: 1px 5px;
+            border-radius: 3px;
+        }
+
         footer {
             margin-top: 30px;
             padding-top: 20px;
@@ -110,24 +131,37 @@
             <h2>📡 API Endpoints</h2>
             <div class="endpoint">
                 <span class="method get">GET</span>
-                <span>/api/feeds</span>
+                <span>/api/feeds <small>(shared-pool catalog, Discover-only)</small></span>
             </div>
             <div class="endpoint">
                 <span class="method post">POST</span>
-                <span>/api/feeds</span>
+                <span>/api/feeds <small>(find-or-create + subscribe this device)</small></span>
             </div>
             <div class="endpoint">
                 <span class="method get">GET</span>
-                <span>/api/feeds/:feed_id/items</span>
+                <span>/api/me/feeds <small>(this device's list — requires X-User-Id)</small></span>
+            </div>
+            <div class="endpoint">
+                <span class="method post">POST</span>
+                <span>/api/feeds/:feed_id/subscribe <small>(requires X-User-Id)</small></span>
+            </div>
+            <div class="endpoint">
+                <span class="method get">GET</span>
+                <span>/api/feeds/:feed_id/articles</span>
             </div>
             <div class="endpoint">
                 <span class="method delete">DELETE</span>
-                <span>/api/feeds/:feed_id</span>
+                <span>/api/feeds/:feed_id <small>(unsubscribe this device — last user prunes the pool)</small></span>
             </div>
             <div class="endpoint">
                 <span class="method get">GET</span>
                 <span>/health</span>
             </div>
+            <p class="api-note">
+                Device model: send <code>X-User-Id</code> (a per-browser random key) to own a
+                subscription list over the shared feed pool. It is a namespace identifier, not
+                authentication.
+            </p>
         </div>
 
         <footer>

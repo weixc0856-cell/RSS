@@ -84,9 +84,13 @@ curl -sS https://rss-worker-production.weixc0856.workers.dev/api/health
 | 5 | Grok xAI News | `https://news.google.com/rss/search?q=Grok+xAI&hl=en-US&gl=US&ceid=US:en` |
 | 6 | People's Daily English | `https://news.google.com/rss/search?q=site:en.people.cn&hl=en-US&gl=US&ceid=US:en` |
 
-- 删除方式：D1 生产库直删 —— HTTP `DELETE /api/feeds/:id` 当前是 stub
-  （见 [src/routes.rs:352](src/routes.rs#L352)），未走 API。先显式删子表再删 feeds，
-  不依赖 D1 的 FK pragma。
+- 删除方式：D1 生产库直删（当时 `DELETE /api/feeds/:id` 是 stub）。先显式删子表再删
+  feeds，不依赖 D1 的 FK pragma。
+  > **supersede（WS7，2026-09-06）**：「HTTP DELETE /api/feeds/:id 当前是 stub」一行已
+  > 三度过时 —— WS1 把它做成真实现（feed + articles 一并删）、WS6 前端 ✕ 开始使用它、
+  > WS7（本工作流）再把它**重新定义为设备退订**（最后订阅者才连池 prune）。历史这段 D1
+  > 直删仅对当时成立；如今删源一律走 `DELETE /api/feeds/:id` 语义。「显式先 articles 后
+  > feeds、不依赖 FK pragma」的删序原则沿用至今（WS7 prune 同序）。
 - 连带删除：`articles` 共 82 篇（feed 4→28 / 5→29 / 6→25，均为 03:01 唯一一次成功
   抓取入库）；`subscriptions` 0、`rss_sources` 无同 URL 行，无其他引用。
 - 删后（04:32 UTC 复核）：`feeds` total 6→**3**（active 3 / failed **0**）；
@@ -175,9 +179,39 @@ SQL sanity（独立复核）：`published_at NOT GLOB`（20 字符 `YYYY-MM-DDTH
   新行 `published_at` 全为 canonical 且立即置顶（10:24:26Z / 10:22:18Z Gloria Steinem 文）——
   证明下一次 cron 触发同样正确。
 
+## WS7 设备模型（2026-09-06，部署验收在此记录）
+
+方向反转声明（详见 [ARCHITECTURE.md §7](ARCHITECTURE.md)）：WS1 曾把 `DELETE /api/feeds/:id`
+定为全局删除、WS6 的 ✕ 文案写「shared catalog」——WS7 **有意反转二者为「设备退订」**，
+不是回归：现在 feeds/articles 是**共享池**，`subscriptions` 把**每台设备各自的列表**挂到池上；
+新设备从**空列表**起步，靠 Discover 一键订阅建议 + 贴 URL 回源；任何人可退订自己的源，
+**最后一个订阅者退订才清池**。`profiles` = 匿名设备命名空间注册表（X-User-Id 头 →
+INTEGER id），**非鉴权、非用户账户**。
+
+上线顺序（评审采纳，两部署动作紧邻、间隙以分钟计）：007 apply → worker 部署 → **立即**
+Pages 部署 → **立即**在真实主浏览器订阅要保留的池源（否则新订阅门一开 0 订阅源即停刷，
+`newest_published_at` 会老化出 <48h）→ 等一个 cron 周期 → 跑契约脚本 → 隐身窗口验隔离。
+
+> 下方「WS7 部署后验收快照」在 Gate 2 实际部署完成后用真实 curl 结果回填，勿在部署前
+> 凭本地写死数字。
+
+### WS7 部署后验收快照（Gate 2 回填）
+
+| 断言 | 结果 |
+|---|---|
+| apply 007 后 `sqlite_master` 见 `profiles`；apply 前 `subscriptions`=0 | 待填 |
+| 匿名 `GET /api/me/feeds` → 400 `X-User-Id header required` | 待填 |
+| 主浏览器订阅保留源后，`GET /api/me/feeds` == 该设备订阅集合 | 待填 |
+| 隐身第二设备 `GET /api/me/feeds` 为空（互不影响） | 待填 |
+| `/api/feeds` 仍 = 池目录（Discover），非设备视图 | 待填 |
+| 共享源退订 → `pruned:false`；独享源退订 → `pruned:true` 且源从池消失 | 待填 |
+| `node scripts/check-articles-contract.mjs`：feeds==D1、`<48h` 成立 | 待填 |
+
 ## 基线用途
 
 - 改动落地并部署后，对比同一端点：feeds.active / feeds.failed、last_run 的
   `status` 与计数、articles 增速应能自洽解释（本仓库修复的累计记账 bug 会让
   `last_run` 的 `partial`/`ok` 判定更准确，而非消除失败本身）。
 - 若需审计单 feed 明细：`GET /api/diagnostics`（`failed_feeds[]` + `last_fetch_run`）。
+- WS7 后 `/api/health` 的 feeds 计数是**全池**（含 0 订阅 dormant 源），不再是任何单台
+  设备的视图 —— 前端健康行已改由该设备自己的 `/api/me/feeds` 推导。

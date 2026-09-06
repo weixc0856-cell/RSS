@@ -9,11 +9,13 @@ Run: `cargo test --all`
 |---|---|
 | `feed.rs` | RSS 2.0 / Atom parsing, entity+CDATA, guid fallback, malformed XML, md5 hash, nullable D1 binding helper; **write-contract**: `<pubDate>`/`<published>`/`<updated>` → canonical UTC ISO at the `parse_document` choke point (offset pubDate shifted to UTC and still sorted correctly), unparseable pubDate preserved verbatim, Atom fractional/offset timestamps collapse to whole seconds |
 | `types.rs` | serde round-trips for all models & requests, ApiResponse shapes |
+| `identity.rs` | `normalize_device_key` host cases: accepts a plain UUID, trims whitespace, rejects blank, rejects >128 bytes (abuse cap) / accepts exactly 128 |
 | `utils.rs` | RFC3339 timestamp; **`normalize_published_at`** boundary table (RFC822 `GMT`/`UT`/`UTC`/`+0000`/`-0500`/`+0530`/`-0000`, RFC3339 `Z`/`+00:00`/`-05:00`/fractional seconds, unpadded day, whitespace), unparseable/zoneless → `None`, fixed-20-char shape + cross-encoding convergence invariants |
 | `queue.rs` | FetchJob serde/parse/reject-malformed; `route_job`: v1 version/type
   contract, unknown-version/type rejection, retired `source_fetch` rejection |
 
-Expected: `71 passed` (run `cargo test --all`).
+Expected: `73 passed` (run `cargo test --all`; WS7: −2 removed Subscription /
+SubscribeFeedRequest serde tests, +4 identity tests).
 
 ## 2. Integration + functional tests (live HTTP)
 Run: `pwsh scripts/test-functional.ps1 -Base https://rss-worker.weixc0856.workers.dev`
@@ -23,6 +25,13 @@ Checks (assertive, exits non-zero on failure):
 - `/api/sources` is a **retired API** (dormant prototype layer): `GET` and `POST`
   answer an honest 501 with `success:false` — no `X-User-Id` is required and
   nothing is read or created (the layer is not reachable through HTTP).
+- WS7 device model (read-only — no subscribe/delete round-trips that would
+  mutate the pool): OPTIONS preflight (allowed Origin + requested method/headers)
+  re-advertises `X-User-Id` in `Access-Control-Allow-Headers` (the custom header
+  makes every request preflight, so omitting it breaks the browser UI); and
+  `GET /api/me/feeds` with a fixed device key returns `success:true` + an array
+  (empty for a brand-new key — the first call provisions one benign profile
+  row), while an anonymous request answers a structured 400.
 
 ## 3. Performance sampling
 Run: `pwsh scripts/test-perf.ps1 -Base <url> -Iterations 30`
@@ -61,8 +70,12 @@ Invariant（ARCHITECTURE.md §3.1）：字符串排序 ≡ 时间排序，仅当
 ```bash
 node scripts/check-articles-contract.mjs        # 只读；对 rss-worker-production + 生产 D1
 ```
-断言：非 NULL `published_at` 全 canonical、feeds=3、无重复 hash；`/api/health`
-`newest_published_at` canonical 且 <48h（证明 `MAX(published_at)` 是真实时间序）；
-每 feed `/api/feeds/:id/articles` 50 条窗口非空、全 canonical、DESC 单调。
+断言：非 NULL `published_at` 全 canonical、feeds 总数 == `/api/feeds` 长度（动态比对，
+不写死个数）、无重复 hash；`/api/health` `newest_published_at` canonical 且 <48h
+（证明 `MAX(published_at)` 是真实时间序）；每 feed `/api/feeds/:id/articles` 50 条窗口
+非空、全 canonical、DESC 单调。
+> WS7 后 `/api/feeds` 是**共享池目录（Discover-only）**，非设备视图 —— 契约脚本的
+> feeds==D1 计数等式必须继续读池目录。`<48h` 断言依赖池内有 ≥1 订阅源且 cron 已跑
+> （订阅门）：上线后先订阅再跑契约，见 PRODUCTION_BASELINE.md 的 WS7 验收。
 > 注：严格 `[0-9]`×16 括号 GLOB 被 D1 拒为 "pattern too complex"，SQL sanity 用等长 `?`
 > 骨架；权威严格校验在回填脚本 `remaining_noncanonical` 与 Rust 写入契约单测里。
