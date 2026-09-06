@@ -246,8 +246,8 @@ pub async fn handle_diagnostics(env: Env) -> Result<Response> {
         .await?
         .results::<Value>()?;
 
-    // User-scoped source layer (dormant vs the legacy feeds board, but surfaced
-    // here so diagnostics is model-complete). Pure additive — the legacy fields
+    // Dormant prototype layer (rss_sources / rss_articles): surfaced here so
+    // diagnostics is model-complete. Pure additive — the feeds/articles fields
     // above are untouched.
     let sources_by_status = db
         .prepare(
@@ -443,4 +443,15 @@ pub async fn handle_delete_feed(feed_id: i32, env: Env) -> Result<Response> {
 /// Dead API — same as subscribe: honest 501, no D1 side effects.
 pub async fn handle_unsubscribe_feed(_user_id: i32, _feed_id: i32) -> Result<Response> {
     json_error("Not implemented", 501)
+}
+
+/// Retired API — the user-scoped `/api/sources` prototype layer is dormant (see
+/// ARCHITECTURE.md §3): feeds/articles is the production model. Every request
+/// here (any method, any sub-path) answers an honest 501 and is guaranteed to
+/// never touch D1 — a retired API, not a half-usable one.
+pub async fn handle_sources_retired() -> Result<Response> {
+    json_error(
+        "source API is retired (rss_sources is a dormant prototype layer)",
+        501,
+    )
 }

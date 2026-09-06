@@ -28,17 +28,7 @@ function Sample {
 Write-Host "== Performance sampling ($Iterations iterations, base=$Base) =="
 Sample "GET /health" { Invoke-WebRequest -Uri "$Base/health" -UseBasicParsing -TimeoutSec 20 }
 Sample "GET /api/diagnostics" { Invoke-WebRequest -Uri "$Base/api/diagnostics" -UseBasicParsing -TimeoutSec 20 }
-Sample "GET /api/sources" { Invoke-WebRequest -Uri "$Base/api/sources" -Headers @{ "X-User-Id" = "perf" } -UseBasicParsing -TimeoutSec 20 }
 Sample "GET /api/feeds" { Invoke-WebRequest -Uri "$Base/api/feeds" -UseBasicParsing -TimeoutSec 20 }
-
-# Articles read (requires a demo source with articles; demo id 1 exists on dev)
-try {
-    $arts = Invoke-WebRequest -Uri "$Base/api/sources/1/articles" -Headers @{ "X-User-Id" = "demo" } -UseBasicParsing -TimeoutSec 30
-    $n = (($arts.Content | ConvertFrom-Json).data).Count
-    Write-Host "source articles available: $n (sampling read path below)"
-    Sample "GET source articles" { Invoke-WebRequest -Uri "$Base/api/sources/1/articles" -Headers @{ "X-User-Id" = "demo" } -UseBasicParsing -TimeoutSec 30 }
-}
-catch { Write-Host "note: no demo source articles to sample" }
 
 Write-Host "perf sampling done"
 exit 0

@@ -101,11 +101,10 @@ fn response_header(response: &worker::Response, name: &str) -> Option<String> {
     response.headers().get(name).ok().flatten()
 }
 
-/// Shared outbound feed-GET core used by the legacy `feeds` pipeline and the
-/// user-scoped `rss_sources` pipeline. Transport hardening only — the HTTP
-/// status mapping, 304 semantics and error messages the callers rely on are
-/// unchanged; this adds a timeout, a response-size cap, a lexical SSRF guard
-/// and a redirect cap.
+/// Shared outbound feed-GET core used by the `feeds` pipeline. Transport
+/// hardening only — the HTTP status mapping, 304 semantics and error messages
+/// the callers rely on are unchanged; this adds a timeout, a response-size cap,
+/// a lexical SSRF guard and a redirect cap.
 ///
 /// Redirect hops are followed manually and EVERY hop (starting URL included) is
 /// re-checked against the SSRF guard — the real risk is

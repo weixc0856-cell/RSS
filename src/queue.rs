@@ -9,15 +9,6 @@ pub struct FetchJob {
     pub url: String,
 }
 
-/// User-scoped job body: produced for `type: "source_fetch"` (and matched by
-/// shape on untyped legacy payloads). Writes `rss_articles`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceJob {
-    pub source_id: i64,
-    pub user_id: String,
-    pub url: String,
-}
-
 /// Queue consumer for `rss-fetch-queue` / `rss-fetch-queue-prod`.
 ///
 /// Routes each message to a handler and records the outcome on the current
@@ -35,30 +26,6 @@ pub async fn consume(
         let run_id = raw["run_id"].as_i64();
 
         match route_job(&raw) {
-            RoutedJob::Source(job) => {
-                match crate::sources::process_source_job(&job.user_id, job.source_id, &job.url, &env)
-                    .await
-                {
-                    Ok(_) => {
-                        console_log!(
-                            "[queue] refreshed source_id={} user={}",
-                            job.source_id,
-                            job.user_id
-                        );
-                        record_run(&env, run_id, 1, 0, 0).await;
-                    }
-                    Err(error) => {
-                        console_log!(
-                            "[queue] source refresh failed source_id={} user={} url={}: {:?}",
-                            job.source_id,
-                            job.user_id,
-                            job.url,
-                            error
-                        );
-                        record_run(&env, run_id, 0, 1, 0).await;
-                    }
-                }
-            }
             RoutedJob::Feed(job) => match crate::feed::fetch_feed(&job.url, &env).await {
                 Ok(inserted) => {
                     console_log!(
@@ -80,10 +47,15 @@ pub async fn consume(
             },
             RoutedJob::Unsupported(reason) => {
                 console_log!("[queue] {reason}: {}", raw);
-                // Do not process a payload we do not understand, but still count
-                // it as one failed job so a run that only ever receives such
-                // messages can reach a terminal state instead of lingering in
-                // 'running' until it is superseded by the next cron tick.
+                // Do not process a payload we do not handle — an unknown
+                // type/version, a malformed job, or a retired `source_fetch`.
+                // It is still counted as one failed job so the run that
+                // scheduled it can reach a terminal state instead of lingering
+                // in 'running' until superseded by the next cron tick. Note the
+                // meaning of `feeds_failed` here: "this job did not complete",
+                // which includes rejected/unsupported/retired messages — real
+                // network fetch failures live on the feed row (error_message /
+                // consecutive_failures), not in this run counter.
                 record_run(&env, run_id, 0, 1, 0).await;
             }
         }
@@ -95,9 +67,7 @@ pub async fn consume(
 
 /// How one queue message should be handled.
 enum RoutedJob {
-    /// User-scoped `rss_sources` job (writes `rss_articles`).
-    Source(SourceJob),
-    /// Legacy `feeds` job (writes `articles`).
+    /// `feeds` job (writes `articles`).
     Feed(FetchJob),
     /// Type/version we do not understand (or a malformed payload): drop it.
     Unsupported(String),
@@ -105,25 +75,26 @@ enum RoutedJob {
 
 /// Route a message to its handler, honouring the job payload contract.
 ///
-/// - v1 payloads carry `type` (`feed_fetch` / `source_fetch`) and `version: 1`.
-///   Any typed message whose `version` is missing or not 1 — e.g. a future v2 —
-///   is `Unsupported`: it must never be processed as if it were v1. An unknown
-///   `type` string is likewise `Unsupported`.
-/// - Messages without `type` are the pre-contract shape and are matched by shape
-///   (`source_id` + `user_id`, else `feed_id`) so already-in-flight legacy jobs
-///   keep working; `version` is ignored on that path.
+/// - The only live handler is `feed_fetch` (v1 payloads carry
+///   `type: "feed_fetch"` and `version: 1`). Any typed message whose `version`
+///   is missing or not 1 — e.g. a future v2 — is `Unsupported`: it must never
+///   be processed as if it were v1. An unknown `type` string is likewise
+///   `Unsupported`.
+/// - `source_fetch` is explicitly rejected: the user-scoped source layer is
+///   dormant/retired (see ARCHITECTURE.md §3), so a typed or legacy
+///   `source_id`/`user_id` message still in flight is dropped as Unsupported
+///   rather than dispatched to a pipeline that no longer exists.
+/// - Messages without `type` are the pre-contract shape; they are matched by
+///   `feed_id` so already-in-flight legacy feed jobs keep working (`version` is
+///   ignored on that path).
 fn route_job(raw: &serde_json::Value) -> RoutedJob {
     let unsupported = |reason: String| RoutedJob::Unsupported(reason);
 
     match raw.get("type") {
         None => {
-            // Legacy shape: infer the handler from the fields present.
-            if raw.get("user_id").is_some() && raw.get("source_id").is_some() {
-                return match serde_json::from_value::<SourceJob>(raw.clone()) {
-                    Ok(job) => RoutedJob::Source(job),
-                    Err(_) => unsupported(format!("malformed legacy source job: {raw}")),
-                };
-            }
+            // Legacy shape: only the feed handler is still valid. A payload
+            // without `feed_id` (including a retired source-shaped job) has no
+            // handler and is dropped below.
             if raw.get("feed_id").is_some() {
                 return match serde_json::from_value::<FetchJob>(raw.clone()) {
                     Ok(job) => RoutedJob::Feed(job),
@@ -143,10 +114,9 @@ fn route_job(raw: &serde_json::Value) -> RoutedJob {
                 ));
             }
             match kind.as_str() {
-                "source_fetch" => match serde_json::from_value::<SourceJob>(raw.clone()) {
-                    Ok(job) => RoutedJob::Source(job),
-                    Err(_) => unsupported(format!("malformed source_fetch job: {raw}")),
-                },
+                "source_fetch" => unsupported(format!(
+                    "source_fetch jobs are retired (rss_sources is a dormant prototype layer): {raw}"
+                )),
                 "feed_fetch" => match serde_json::from_value::<FetchJob>(raw.clone()) {
                     Ok(job) => RoutedJob::Feed(job),
                     Err(_) => unsupported(format!("malformed feed_fetch job: {raw}")),
@@ -162,7 +132,7 @@ fn route_job(raw: &serde_json::Value) -> RoutedJob {
 /// them even when the producer sent `contentType: json`). worker-rs therefore
 /// surfaces e.g. `"{\"feed_id\":3,...}"` as a JSON *string* body. Normalise it
 /// back to a JSON object so both object and string payloads match the
-/// `SourceJob` / `FetchJob` shapes.
+/// `FetchJob` shape.
 fn normalize_body(body: serde_json::Value) -> serde_json::Value {
     match body {
         serde_json::Value::String(text) => {
@@ -172,13 +142,13 @@ fn normalize_body(body: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Best-effort enqueue of one initial-fetch job right after a feed/source is
-/// created, so the first articles arrive without waiting for the next cron pass.
+/// Best-effort enqueue of one initial-fetch job right after a feed is created,
+/// so the first articles arrive without waiting for the next cron pass.
 ///
 /// Never fails the create that already succeeded: on any enqueue error we log
-/// loudly and the scheduler remains the fallback (both INSERTs set the row due
-/// immediately — `next_fetch_at = datetime('now')` for feeds, `last_fetched_at
-/// IS NULL` for sources — so the next cron cycle still fetches it).
+/// loudly and the scheduler remains the fallback (the feed INSERT sets the row
+/// due immediately — `next_fetch_at = datetime('now')` — so the next cron
+/// cycle still fetches it).
 ///
 /// Sends a JSON *string* body (the same rationale as the scheduler: worker-rs
 /// serializes a `Value` object into a JS object whose properties the runtime
@@ -337,29 +307,6 @@ mod tests {
     }
 
     #[test]
-    fn source_job_round_trips_and_parses_scheduler_payload() {
-        let json = r#"{"source_id":9,"user_id":"alice","url":"https://example.com/rss"}"#;
-        let job: SourceJob = serde_json::from_str(json).expect("parse source job");
-        assert_eq!(job.source_id, 9);
-        assert_eq!(job.user_id, "alice");
-        assert_eq!(job.url, "https://example.com/rss");
-
-        let serialized = serde_json::to_string(&job).expect("serialize");
-        let back: SourceJob = serde_json::from_str(&serialized).expect("round trip");
-        assert_eq!(back.source_id, job.source_id);
-        assert_eq!(back.user_id, job.user_id);
-    }
-
-    #[test]
-    fn source_job_rejects_malformed_payloads() {
-        assert!(serde_json::from_str::<SourceJob>(r#"{"source_id":1,"url":"x"}"#).is_err());
-        assert!(
-            serde_json::from_str::<SourceJob>(r#"{"source_id":"x","user_id":"a","url":"x"}"#)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn normalize_body_parses_embedded_json_string() {
         // Mirrors how workerd delivers string bodies verbatim, e.g. a producer
         // that sent `"{\"feed_id\":7,\"url\":\"https://a.b/rss\"}"`.
@@ -399,7 +346,11 @@ mod tests {
     }
 
     #[test]
-    fn route_job_accepts_versioned_source_fetch() {
+    fn route_job_rejects_retired_source_fetch() {
+        // `source_fetch` was the dormant user-scoped layer's job type. That
+        // pipeline is retired (see ARCHITECTURE.md §3), so even a well-formed
+        // typed v1 message must be explicitly rejected — never dispatched to a
+        // pipeline that no longer exists.
         let raw = serde_json::json!({
             "version": 1,
             "type": "source_fetch",
@@ -408,10 +359,9 @@ mod tests {
             "url": "https://example.com/rss",
             "run_id": 1
         });
-        match route_job(&raw) {
-            RoutedJob::Source(job) => assert_eq!(job.source_id, 9),
-            other => panic!("expected Source, got {:?}", std::mem::discriminant(&other)),
-        }
+        assert!(
+            matches!(route_job(&raw), RoutedJob::Unsupported(ref r) if r.contains("retired"))
+        );
     }
 
     #[test]
@@ -468,14 +418,17 @@ mod tests {
     }
 
     #[test]
-    fn route_job_legacy_source_shape_routes_by_source_and_user() {
+    fn route_job_rejects_legacy_source_shaped_job() {
+        // A pre-contract (untyped) `{source_id, user_id, url}` payload is a
+        // retired-source job: there is no Source handler left to dispatch to,
+        // so it must drop as Unsupported rather than be processed.
         let raw = serde_json::json!({
             "source_id": 2,
             "user_id": "bob",
             "url": "https://a.b/rss",
             "run_id": 5
         });
-        assert!(matches!(route_job(&raw), RoutedJob::Source(_)));
+        assert!(matches!(route_job(&raw), RoutedJob::Unsupported(_)));
     }
 
     #[test]

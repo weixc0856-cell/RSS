@@ -72,7 +72,7 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
             .ok_or_else(|| Error::RustError("fetch_run id missing".to_string()))?
     };
 
-    // ---- select due legacy feeds (next_fetch_at based) -----------------------
+    // ---- select due feeds (next_fetch_at based) -----------------------------
     let stmt = db.prepare(
         "SELECT id, url FROM feeds
          WHERE enabled = 1
@@ -108,40 +108,8 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
         sent += 1;
     }
 
-    // ---- user-scoped sources (existing per-source interval semantics) --------
-    let src_stmt = db.prepare(
-        "SELECT id, user_id, url FROM rss_sources
-         WHERE enabled = 1
-           AND (last_fetched_at IS NULL
-                OR (julianday('now') - julianday(last_fetched_at)) * 1440 >= fetch_interval_minutes)
-         ORDER BY id",
-    );
-    let src_rows = src_stmt.all().await?;
-    let sources = src_rows.results::<Value>()?;
-    let mut sent_sources = 0usize;
-    for row in sources {
-        let source_id = row["id"].as_i64().unwrap_or(0);
-        let user_id = row["user_id"].as_str().unwrap_or("");
-        let url = row["url"].as_str().unwrap_or("");
-        if source_id <= 0 || user_id.is_empty() || url.is_empty() {
-            continue;
-        }
-        // JSON string body, same rationale as the feed jobs above.
-        let payload = serde_json::to_string(&serde_json::json!({
-            "version": 1,
-            "type": "source_fetch",
-            "source_id": source_id,
-            "user_id": user_id,
-            "url": url,
-            "run_id": run_id
-        }))
-        .map_err(|e| Error::RustError(e.to_string()))?;
-        queue.send(payload.as_str()).await?;
-        sent_sources += 1;
-    }
-
     // ---- finalize scheduling side of the run ----------------------------------
-    let total = sent + sent_sources;
+    let total = sent;
     // Literal numeric SQL: values are integers we produced; avoids binding issues
     // in this hot path and keeps the run row accurate even if a consumer is slow.
     let finalize_sql = format!(
@@ -162,11 +130,6 @@ pub async fn run(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Resu
         backfill.run().await?;
     }
 
-    console_log!(
-        "[scheduler] run_id={} queued {} legacy feed(s) and {} user source(s)",
-        run_id,
-        sent,
-        sent_sources
-    );
+    console_log!("[scheduler] run_id={} queued {} feed(s)", run_id, sent);
     Ok(())
 }

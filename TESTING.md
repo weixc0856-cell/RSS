@@ -10,25 +10,24 @@ Run: `cargo test --all`
 | `feed.rs` | RSS 2.0 / Atom parsing, entity+CDATA, guid fallback, malformed XML, md5 hash, nullable D1 binding helper; **write-contract**: `<pubDate>`/`<published>`/`<updated>` → canonical UTC ISO at the `parse_document` choke point (offset pubDate shifted to UTC and still sorted correctly), unparseable pubDate preserved verbatim, Atom fractional/offset timestamps collapse to whole seconds |
 | `types.rs` | serde round-trips for all models & requests, ApiResponse shapes |
 | `utils.rs` | RFC3339 timestamp; **`normalize_published_at`** boundary table (RFC822 `GMT`/`UT`/`UTC`/`+0000`/`-0500`/`+0530`/`-0000`, RFC3339 `Z`/`+00:00`/`-05:00`/fractional seconds, unpadded day, whitespace), unparseable/zoneless → `None`, fixed-20-char shape + cross-encoding convergence invariants |
-| `queue.rs` | FetchJob (legacy) & SourceJob (user) serde/parse/reject-malformed |
+| `queue.rs` | FetchJob serde/parse/reject-malformed; `route_job`: v1 version/type
+  contract, unknown-version/type rejection, retired `source_fetch` rejection |
 
-Expected: `63 passed` (run `cargo test --all`).
+Expected: `71 passed` (run `cargo test --all`).
 
 ## 2. Integration + functional tests (live HTTP)
 Run: `pwsh scripts/test-functional.ps1 -Base https://rss-worker.weixc0856.workers.dev`
 
 Checks (assertive, exits non-zero on failure):
-- health, diagnostics shape, legacy feeds list
-- user-scoped `/api/sources`: create → duplicate conflict(409) → isolation (user B
-  cannot see A) → list own → PUT update → POST fetch (worker fetch→parse→rss_articles)
-  → GET articles non-empty with fields → delete by non-owner is no-op → owner delete
-  removes source.
+- health, diagnostics shape, feeds list
+- `/api/sources` is a **retired API** (dormant prototype layer): `GET` and `POST`
+  answer an honest 501 with `success:false` — no `X-User-Id` is required and
+  nothing is read or created (the layer is not reachable through HTTP).
 
 ## 3. Performance sampling
 Run: `pwsh scripts/test-perf.ps1 -Base <url> -Iterations 30`
 
-Samples avg / p95 / max latency (ms) for: health, diagnostics, sources list, feeds
-list, and (if present) source articles read.
+Samples avg / p95 / max latency (ms) for: health, diagnostics, feeds list.
 
 ## 4. Cron / scheduling diagnostics
 Production-only, best effort:

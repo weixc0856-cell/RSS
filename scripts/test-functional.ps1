@@ -52,55 +52,33 @@ Check "diagnostics has cron_ticks" ($null -ne $d.data.cron_ticks)
 $f = (Call-Json "/api/feeds").Content | ConvertFrom-Json
 Check "GET /api/feeds success + array" ($f.success -eq $true -and $f.data -is [array])
 
-# 4. User-scoped isolation + CRUD
-$u1 = "t_$(Get-Date -Format 'HHmmssfff')_a"
-$u2 = "t_$(Get-Date -Format 'HHmmssfff')_b"
-$srcBody = @{ url = "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"; title = "Test NYT $u1"; fetch_interval_minutes = 60 } | ConvertTo-Json -Compress
-
-$created = (Call-Json "/api/sources" $u1 "POST" $srcBody).Content | ConvertFrom-Json
-Check "POST /api/sources creates ($u1)" ($created.success -eq $true -and $null -ne $created.data.id)
-$sid = $created.data.id
-
-$before = (Call-Json "/api/sources" $u2).Content | ConvertFrom-Json
-Check "isolation: $u2 cannot see $u1 source" (@($before.data | Where-Object { $_.id -eq $sid }).Count -eq 0)
-
-$mine = (Call-Json "/api/sources" $u1).Content | ConvertFrom-Json
-Check "GET /api/sources lists own source" (@($mine.data | Where-Object { $_.id -eq $sid }).Count -eq 1)
-
-# duplicate create -> conflict
-try {
-    $dup = Call-Json "/api/sources" $u1 "POST" $srcBody
-    Check "duplicate create rejected (status 409)" ($dup.StatusCode -eq 409)
+# 4. /api/sources is a retired API (dormant prototype layer): GET and POST both
+# answer an honest 501 with success:false. No X-User-Id is sent — the endpoint
+# must answer the same to everyone and must not touch D1.
+foreach ($probe in @(@{ Method = "GET"; Path = "/api/sources"; Body = $null },
+                     @{ Method = "POST"; Path = "/api/sources"; Body = '{"url":"https://rss.nytimes.com/services/xml/rss/nyt/World.xml"}' })) {
+    $status = 0; $body = $null
+    try {
+        if ($null -eq $probe.Body) {
+            $resp = Invoke-WebRequest -Uri ($Base + $probe.Path) -Method $probe.Method -UseBasicParsing -TimeoutSec $Timeout
+        }
+        else {
+            $resp = Invoke-WebRequest -Uri ($Base + $probe.Path) -Method $probe.Method `
+                -ContentType "application/json" -Body $probe.Body -UseBasicParsing -TimeoutSec $Timeout
+        }
+        $status = $resp.StatusCode; $body = $resp.Content
+    }
+    catch {
+        $status = [int]$_.Exception.Response.StatusCode
+        try { $body = $_.ErrorDetails.Message } catch {}
+    }
+    Check ("{0} {1} == 501" -f $probe.Method, $probe.Path) ($status -eq 501) "got $status"
+    if ($body) {
+        $j = $body | ConvertFrom-Json
+        Check ("{0} {1} success=false" -f $probe.Method, $probe.Path) ($j.success -eq $false)
+        Check ("{0} {1} has error text" -f $probe.Method, $probe.Path) (-not [string]::IsNullOrEmpty($j.error))
+    }
 }
-catch {
-    $code = [int]$_.Exception.Response.StatusCode
-    Check "duplicate create rejected (status 409)" ($code -eq 409) "got $code"
-}
-
-# update
-$up = @{ title = "Test NYT renamed"; fetch_interval_minutes = 15 } | ConvertTo-Json -Compress
-$upd = (Call-Json "/api/sources/$sid" $u1 "PUT" $up).Content | ConvertFrom-Json
-Check "PUT /api/sources updates" ($upd.success -eq $true)
-
-# manual fetch (integration: worker fetch -> parse -> rss_articles)
-$fetch = (Call-Json "/api/sources/$sid/fetch" $u1 "POST").Content | ConvertFrom-Json
-Check "POST /api/sources/:id/fetch ok" ($fetch.success -eq $true)
-Check "fetch stored articles > 0" ($fetch.data.total -gt 0)
-
-$arts = (Call-Json "/api/sources/$sid/articles" $u1).Content | ConvertFrom-Json
-Check "GET source articles non-empty" ($arts.success -eq $true -and $arts.data.Count -gt 0)
-if ($arts.data.Count -gt 0) {
-    Check "article has title/link/hash" ($arts.data[0].title -and $arts.data[0].link -and $arts.data[0].hash)
-}
-
-# isolation on delete & cross-user delete attempt of own source by other user no-op
-$otherDel = (Call-Json "/api/sources/$sid" $u2 "DELETE").Content | ConvertFrom-Json
-$mineAfter = (Call-Json "/api/sources" $u1).Content | ConvertFrom-Json
-Check "delete by non-owner does not remove source" (@($mineAfter.data | Where-Object { $_.id -eq $sid }).Count -eq 1)
-
-$del = (Call-Json "/api/sources/$sid" $u1 "DELETE").Content | ConvertFrom-Json
-$mineEnd = (Call-Json "/api/sources" $u1).Content | ConvertFrom-Json
-Check "owner delete removes source" (@($mineEnd.data | Where-Object { $_.id -eq $sid }).Count -eq 0)
 
 Write-Host ""
 if ($script:fails -gt 0) {

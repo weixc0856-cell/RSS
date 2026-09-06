@@ -1,7 +1,5 @@
 mod types;
 mod routes;
-mod auth;
-mod sources;
 mod db;
 mod feed;
 mod queue;
@@ -59,34 +57,12 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, "/api/diagnostics") => handle_diagnostics(env).await,
         (Method::Get, "/api/health") => handle_health(env).await,
 
-        // User-scoped RSS source CRUD (/api/sources)
-        (Method::Get, "/api/sources") => {
-            let user_id = auth::current_user(&req);
-            sources::list_sources(&user_id, &env).await
-        }
-        (Method::Post, "/api/sources") => {
-            let user_id = auth::current_user(&req);
-            sources::create_source(req, &user_id, &env).await
-        }
-        (Method::Post, path)
-            if path.starts_with("/api/sources/") && path.ends_with("/fetch") =>
-        {
-            let user_id = auth::current_user(&req);
-            sources::trigger_source_fetch(req, &user_id, &env).await
-        }
-        (Method::Get, path)
-            if path.starts_with("/api/sources/") && path.ends_with("/articles") =>
-        {
-            let user_id = auth::current_user(&req);
-            sources::list_source_articles(req, &user_id, &env).await
-        }
-        (Method::Put, path) if path.starts_with("/api/sources/") => {
-            let user_id = auth::current_user(&req);
-            sources::update_source(req, &user_id, &env).await
-        }
-        (Method::Delete, path) if path.starts_with("/api/sources/") => {
-            let user_id = auth::current_user(&req);
-            sources::delete_source(req, &user_id, &env).await
+        // /api/sources — RETIRED API. The rss_sources prototype layer is
+        // dormant (see ARCHITECTURE.md §3): every request here answers an
+        // honest 501, never dispatches and never touches D1. Exact-surface
+        // match (`==` or a `/`-suffix), not a bare prefix.
+        (_, p) if p == "/api/sources" || p.starts_with("/api/sources/") => {
+            handle_sources_retired().await
         }
 
         // Feed management
@@ -201,7 +177,7 @@ fn apply_api_headers(response: &mut Response, origin: Option<&str>) -> Result<()
     }
     response
         .headers_mut()
-        .set("Access-Control-Allow-Headers", "Content-Type, X-User-Id")?;
+        .set("Access-Control-Allow-Headers", "Content-Type")?;
     response
         .headers_mut()
         .set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")?;
