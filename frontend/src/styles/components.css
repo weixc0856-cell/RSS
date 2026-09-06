@@ -1,4 +1,4 @@
-/* Top bar: title, search, sort, environment switch, actions. */
+/* Top bar: title, search, sort, actions. */
 .topbar {
   display: flex;
   flex-wrap: wrap;

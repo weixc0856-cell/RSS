@@ -402,7 +402,9 @@ OpenAI News，`fetch_interval_minutes=15`、`enabled=1`、`next_fetch_at=NULL`�
       删列仍属破坏性决定，须单独授权）。
 - [ ] 数据迁移脚本参数化 DB id 后入库（当前读 `.env`）。
 - [ ] 模块拆分（api/fetcher/parser/persistence）为可选重构，不阻塞业务。
-- [ ] CI：worker deploy + pages deploy workflow 固化（当前仅 rust.yml）。
+- [ ] CI：worker deploy + pages deploy workflow 固化（当前 `ci.yml` 仅含质量门禁
+      —— Rust test/clippy `-D warnings`/wasm + 前端 typecheck/build；部署段见 SETUP.md
+      示例，需 CF secrets，未随库提供）。
 - [ ] 前端相对时间对 **naive-UTC scheduler 时间戳**（`scheduler.last_run.started_at` /
       `last_fetch_run.started_at` 等，形如 `"2026-09-06 12:15:22"`，无 `Z`）按本机时区解析：
       `timeAgo`/`new Date` 在非 UTC 设备把「X 分钟前」偏成 +8h（UTC+8 实测 sync / feed `last`

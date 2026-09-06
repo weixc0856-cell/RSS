@@ -1,0 +1,64 @@
+name: CI
+
+# Quality gate: mirrors what a clean checkout must pass before a release
+# commit (see TESTING.md §1 + §5). Covers the Rust Worker (host tests,
+# clippy -D warnings, wasm32 compile for release + tests) and the Astro
+# frontend (typecheck + static build). Deployment is NOT part of this file —
+# that workflow is still an open TODO (ARCHITECTURE.md §9) because it needs
+# Cloudflare secrets; see SETUP.md for the illustrative template.
+#
+# NOTE: wasm32-unknown-unknown is not a host target — the runner toolchain is
+# installed explicitly with `components: clippy` + `targets: wasm32...` so the
+# gate is reproducible regardless of the image's preinstalled toolchain.
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (test + clippy + wasm)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust (stable, clippy, wasm32 target)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+        targets: wasm32-unknown-unknown
+    - name: Build (host)
+      run: cargo build --verbose
+    - name: Run tests (host)
+      run: cargo test --verbose
+    - name: Clippy — deny warnings (all targets/features)
+      run: cargo clippy --all-targets --all-features -- -D warnings
+    - name: Check wasm32 (release build target)
+      run: cargo check --target wasm32-unknown-unknown --release
+    - name: Check wasm32 (test cfg, not shipped)
+      run: cargo check --target wasm32-unknown-unknown --tests
+
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+    - name: Install dependencies
+      run: npm ci
+    - name: Typecheck
+      run: npm run typecheck
+    - name: Build
+      run: npm run build

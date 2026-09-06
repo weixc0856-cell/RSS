@@ -172,7 +172,19 @@ let log_level = env.var("LOG_LEVEL")?;
 
 ## CI/CD 集成
 
-### GitHub Actions（推荐生产部署方式）
+### GitHub Actions（生产部署示例）
+
+> **⚠️ 示例配置，非随库提供、非开箱即用。** 本仓库当前只有一个真实 workflow：
+> `.github/workflows/ci.yml` —— 质量门禁（Rust test / clippy `-D warnings` /
+> wasm32 检查 + 前端 typecheck/build，见 TESTING.md）。下面的 Secrets 表与部署 YAML
+> 是**说明性模板**（脚手架产物），仓库**没有** `deploy-production.yml` 这个文件。
+> 若要在 CI 里部署，请按真实链路对齐后再提交：
+> - **分支**：仓库默认分支是 `master`（示例 YAML 里的 `main` 要改）。
+> - **资源**：Secrets 与 binding 必须匹配 `wrangler.toml.template` +
+>   `scripts/render-config.ps1` 实际渲染的变量（`.env.local` / `.env.production`）。
+>   worker 二进制只用 D1 + Queue + Cron；模板里的 `kv_namespaces`(CACHE) 与
+>   `r2_buckets`(RSS_BUCKET) 是脚手架残留（部署仍会要求它们真实存在），可一并裁掉。
+> - `render-config.ps1` 会把缺失的 `{{KEY}}` 直接 throw，先在本地跑通再上 CI。
 
 在 GitHub 中安全地存储敏感信息：
 

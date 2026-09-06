@@ -22,13 +22,15 @@ npm run dev          # http://localhost:4321
 
 ## Env
 
-Defaults point at the live Workers. To override at build time copy
-`.env.example` to `.env` and uncomment:
+One Worker API base per build: `ASTRO_PUBLIC_API_BASE` (Vite public env,
+compile-time). Unset, it defaults to the production Worker
+(`https://rss-worker-production.weixc0856.workers.dev`) — see `src/lib/api.ts`.
+To point a build elsewhere, copy `.env.example` to `.env` and uncomment the
+variable.
 
-- `ASTRO_PUBLIC_API_DEV` — dev Worker
-- `ASTRO_PUBLIC_API_PROD` — prod Worker
-
-You can also switch Dev/Prod inside the UI (persisted in localStorage).
+Environment is a **deployment** concern, not a per-user UI switch: there is no
+Dev/Prod toggle in the UI and nothing is persisted for it. Every key read from
+`import.meta.env` is declared in `src/env.d.ts`.
 
 ## Build
 

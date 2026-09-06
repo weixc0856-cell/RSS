@@ -1,10 +1,9 @@
 /// <reference types="astro/client" />
 
 interface ImportMetaEnv {
-  /** Dev API base (defaults to the rss-worker workers.dev URL). */
-  readonly ASTRO_PUBLIC_API_DEV?: string;
-  /** Production API base (defaults to rss-worker-production). */
-  readonly ASTRO_PUBLIC_API_PROD?: string;
+  /** Worker API base — build-time, deployment-level override only (no runtime/UI
+   *  switch). When unset, api.ts falls back to the production Worker URL. */
+  readonly ASTRO_PUBLIC_API_BASE?: string;
 }
 
 interface ImportMeta {
