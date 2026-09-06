@@ -330,6 +330,35 @@ last_modified`。
     **立即**真实浏览器订阅保留源 → 等 cron → 契约脚本 → 隐身第二设备验隔离）。结果与
     Discover 源数快照记入 `PRODUCTION_BASELINE.md`「WS7 设备模型」。
 
+- [x] **WS7.1 Discover 推荐目录（2026-09-06）**：给新设备一个 curated on-ramp ——
+  **内置静态推荐目录**，worker 0 changes（无新表 / 无新 API / 不自动订阅 / 不建第二套 Feed
+  模型）。Discover = **Recommended Catalog（目录段）+ Shared Pool（池尾段）两个独立语义段**，
+  前端分别 render、绝不合并 —— 目录是系统精选，池尾只是「池里有、可订」的共享残留，杜绝
+  「用户自贴的怪源被系统当成推荐源」。commit A `5ec3819`（证据层，test）→ B（feat，
+  本记录所在 commit）。
+  - **目录 = 产品配置**：`frontend/src/lib/recommended-feeds.ts`
+    （`{name,url,category,description,tier:A|B|C}` 静态元数据，零 import、零浏览器 API）。
+    移除推荐 = 删行（永不动 feeds/articles/subscriptions）；源死掉 = 重跑 harness → 更新
+    evidence → 再改目录。19 源 = 4 锚点（BBC/OpenAI/V2EX/Guardian，prod-live snapshot）+
+    15 edge 验证 GREEN。
+  - **证据 ≠ 产品**：`scripts/ws7-1-verified.json` 只校验目录；RED/AMBER 行**永远保留**
+    （「为什么 IEEE/arXiv/Reuters 不在」的答案）。判死理由（2026-09-06 edge）：IEEE/SAE/JPL/
+    机器之心返回 HTML、Green Car Congress 530、Reuters 404、BleepingComputer 403、
+    arXiv RSS 在 `rss.arxiv.org` 与 canonical `export.arxiv.org` 均为空文档。
+  - **验证**：`scripts/ws7-1-validate-feeds.mjs`（maintenance tool，非日常 CI：每次跑会给
+    dev 池瞬态增删自建 feed，并 REFUSE production host）—— 用 dev worker 真抓取判
+    GREEN/AMBER/RED（HTTP + parse + article contract 含 canonical `published_at`）；
+    `scripts/ws7-1-catalog-drill.mjs`（dev 回归，静态 gate「每行 GREEN」+ API round-trip，
+    见 TESTING.md §2）。
+  - **匹配规则（前端不另造 normalizer）**：已订判定仅
+    `feed.url === 目录.url || feed.normalized_url === 目录.url` → Discover 行转 ✓
+    （非交互、留原类别）；未订显示 `+`。**两个入口不统一**：目录行 `+` →
+    `addFeed(url,name)`（find-or-create + 订到本设备）；池尾行 `+` → `subscribeFeed(id)`。
+  - **编辑决策**：Google AI Blog 契约全绿但 feed 混招聘帖 → tier C（niche）；
+    Mozilla Hacks 低产但活 → C；arXiv 两个官方宿主均空 → 不入。Security 空、Engineering
+    仅 NASA —— 宁缺毋滥，要补类另开一轮 edge 验证再入目录（**不把非 GREEN 或已判 AMBER
+    的源留在定稿目录**）。
+
 ### 7.1 默认源一次性 bootstrap（006，非 reconcile）
 
 `migrations/006_default_feeds.sql` 幂等地种入当前 3 个健康源（NYT World / BBC News /

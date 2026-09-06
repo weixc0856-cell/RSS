@@ -10,10 +10,12 @@
   <div class="nav-label">Feeds</div>
   <nav class="nav" id="feedNav" aria-label="Feeds"></nav>
 
-  <!-- One-click subscribe suggestions: shared-pool feeds this device does not
-       yet follow. Rendered by app.ts (renderDiscover) from GET /api/feeds minus
-       the device list — pool feeds are only ever added here, never auto-added. -->
-  <div id="discover" class="discover" aria-label="Discover shared feeds"></div>
+  <!-- One-click subscribe suggestions, two independent segments rendered by
+       app.ts (renderDiscover): the static Recommended catalog (from
+       recommended-feeds.ts — "Recommended") followed by the shared-pool tail
+       (pool feeds outside that catalog — "Shared pool"). Suggestions are only
+       ever added here on click — nothing auto-subscribes. -->
+  <div id="discover" class="discover" aria-label="Discover recommended feeds and shared pool"></div>
 
   <div class="sidebar-bottom">
     <form class="feed-form" id="feedForm">

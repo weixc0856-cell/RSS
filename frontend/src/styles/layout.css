@@ -232,9 +232,10 @@
   }
 }
 
-/* Discover strip: one-click subscribe suggestions from the shared pool.
-   Distinct visual zone below the device's own feed list (border-top divider).
-   Hidden entirely (element.hidden) when nothing is left to suggest. */
+/* Discover strip: one-click subscribe suggestions — the static Recommended
+   catalog up top (category-grouped) plus a shared-pool tail, two independent
+   segments. Distinct visual zone below the device's own feed list (border-top
+   divider). Hidden entirely (element.hidden) when neither segment has content. */
 .discover {
   margin-top: 16px;
   border-top: 1px solid var(--line);
@@ -251,6 +252,54 @@
 
 .discover-label {
   padding: 0 10px 6px;
+  color: #999991;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* Recommended category group header — smaller than the segment label, sits
+   tight above its rows. */
+.discover-category {
+  margin-top: 4px;
+  padding: 4px 12px 1px;
+  color: #b0b0a8;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* "✓" badge on a Recommended row this device already follows. */
+.discover-check {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: #ddebd8;
+  color: #3a7a3a;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+/* Followed Recommended rows are informational, not controls — no hover
+   affordance, no pointer cursor. */
+.discover-feed.subscribed,
+.discover-feed.subscribed:hover {
+  cursor: default;
+  background: transparent;
+}
+
+/* Shared-pool tail segment label — extra top space marks the segment break
+   from Recommended above it. */
+.discover-pool-label {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding: 8px 10px 6px;
   color: #999991;
   font-size: 10px;
   font-weight: 750;

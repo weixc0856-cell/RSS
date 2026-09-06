@@ -47,6 +47,29 @@ production host unless `WS7_DRILL_ALLOW_PROD=1`. Self-cleaning: a preamble
 clears any leftover drill feed from a crashed prior run and the drill asserts the
 pool returns to its pre-run snapshot, so it is safe to re-run.
 
+### WS7.1 Discover catalog (harness = maintenance tool; drill = regression)
+
+Run: `node scripts/ws7-1-validate-feeds.mjs` (maintenance, dev edge)
+Run: `node scripts/ws7-1-catalog-drill.mjs` (dev functional regression)
+
+- The **edge validation harness** (`ws7-1-validate-feeds.mjs`) is a maintenance /
+  verification tool, NOT daily CI: it asks the DEV worker's real fetch path (true
+  Rust parser + CF-edge reachability) to judge each official-source RSS candidate
+  GREEN/AMBER/RED — HTTP ok + parse ok + ≥1 article + title + link-or-id +
+  every non-null `published_at` canonical — and writes evidence to
+  `ws7-1-verified.json`. Per candidate it transiently adds + prunes its own feed;
+  refuses the production host. Re-run it when a catalog feed dies, to refresh the
+  evidence before editing `recommended-feeds.ts`.
+- The **catalog drill** (`ws7-1-catalog-drill.mjs`) is the WS7.1 regression:
+  static gates (catalog non-empty, unique name/url, complete fields, pure-data
+  module, **every shipped row has a GREEN verdict in `ws7-1-verified.json`**) plus
+  an API round-trip that mirrors the Discover UI semantics exactly: Recommended
+  "+" on device A → row turns "✓"; device B "+" on the same url converges on A's
+  pool feed (`created:false`, no duplicate); a catalog-row pool feed renders once
+  and is excluded from the Shared-pool tail; re-add is idempotent (`already:true`);
+  last-user unsubscribe prunes; pool snapshot restored. Mutates the pool
+  transiently (creates + prunes one feed); dev-only.
+
 ## 3. Performance sampling
 Run: `pwsh scripts/test-perf.ps1 -Base <url> -Iterations 30`
 

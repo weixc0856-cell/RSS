@@ -13,15 +13,19 @@ import {
   triggerFetch,
 } from "../lib/api";
 import type { Article, Diagnostics, Feed } from "../lib/types";
+import { RECOMMENDED_FEEDS } from "../lib/recommended-feeds";
+import type { RecommendedFeed } from "../lib/recommended-feeds";
 import { initMotion, refreshMotion } from "./animate";
 
 /** App controller: owns UI state and rendering. Data access only via lib/api.
  *
  *  Device model (see ARCHITECTURE.md §3): `feeds` below is THIS device's list
  *  (GET /api/me/feeds) — the only source the nav may read. `poolFeeds` is the
- *  shared-pool catalog (GET /api/feeds), Discover-only: it feeds the one-click
- *  suggestion strip and is NEVER shown as this device's feeds. New devices
- *  start empty and subscribe from Discover or by pasting a feed URL. */
+ *  shared-pool catalog (GET /api/feeds), Discover-only: it is NEVER shown as
+ *  this device's feeds. Discover renders two independent segments — the static
+ *  Recommended catalog (recommended-feeds.ts) up top, then a Shared-pool tail
+ *  of pool feeds outside that catalog. New devices start empty and subscribe
+ *  from Discover or by pasting a feed URL. */
 
 function $<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -328,35 +332,102 @@ async function loadPool(): Promise<void> {
   renderDiscover();
 }
 
-/** Render the one-click subscribe strip: shared-pool feeds this device does not
- *  already follow. Never auto-subscribes — the strip is a suggestion only, and
- *  an empty list stays empty until the user acts. Hides itself when nothing is
- *  left to suggest. */
+/** True when THIS device already follows the feed behind a catalog URL.
+ *  Matched ONLY by existing semantics — the pool row's url or normalized_url
+ *  equals the catalog's frozen url. No new normalizer is introduced here. */
+function followsCatalogUrl(catUrl: string): boolean {
+  return feeds.some((f) => f.url === catUrl || f.normalized_url === catUrl);
+}
+
+/** One Recommended row. Not yet followed: a "+" button that addFeed()s the
+ *  catalog url (find-or-create + subscribe this device). Already followed: a
+ *  non-interactive "✓" row that STAYS in its category — subscription state is
+ *  visible, the row does not vanish. */
+function recommendationRow(cat: RecommendedFeed): string {
+  const name = escapeHtml(cat.name);
+  if (followsCatalogUrl(cat.url)) {
+    return `<div class="discover-feed subscribed" title="${name} — on this device">
+          <span class="discover-check" aria-hidden="true">✓</span>
+          <span class="discover-name">${name}</span>
+        </div>`;
+  }
+  return `<button class="discover-feed" type="button"
+          data-action="subscribe-recommended" data-url="${escapeHtml(cat.url)}"
+          data-name="${escapeHtml(cat.name)}"
+          title="Add ${name} on this device">
+        <span class="discover-plus" aria-hidden="true">+</span>
+        <span class="discover-name">${name}</span>
+      </button>`;
+}
+
+/** Render the two independent Discover segments — never merged:
+ *
+ *  1. "Recommended": the static catalog, grouped by category. Rows carry live
+ *     subscription state ("+" to add, "✓" once followed).
+ *  2. "Shared pool": the tail — pool feeds this device does not follow AND
+ *     that are not already a Recommended row above (nothing renders twice).
+ *
+ *  Never auto-subscribes — these are suggestions only. Hides itself only when
+ *  BOTH segments have nothing to show. */
 function renderDiscover(): void {
+  // Segment 1 — static Recommended catalog, grouped by category in catalog
+  // order (Map preserves insertion order).
+  const groups = new Map<string, RecommendedFeed[]>();
+  for (const cat of RECOMMENDED_FEEDS) {
+    const rows = groups.get(cat.category) ?? [];
+    rows.push(cat);
+    groups.set(cat.category, rows);
+  }
+  const recommended =
+    RECOMMENDED_FEEDS.length === 0
+      ? ""
+      : `<div class="discover-label">Recommended</div>` +
+        [...groups.entries()]
+          .map(
+            ([category, rows]) =>
+              `<div class="discover-category">${escapeHtml(category)}</div>` +
+              rows.map(recommendationRow).join("")
+          )
+          .join("");
+
+  // Segment 2 — shared-pool tail: pool feeds this device does not follow and
+  // that are not catalog rows (recommendations live above, never duplicated
+  // here).
   const mine = new Set(feeds.map((f) => f.id));
-  const suggestions = poolFeeds.filter((f) => !mine.has(f.id));
-  if (suggestions.length === 0) {
+  const poolTail = poolFeeds.filter(
+    (f) =>
+      !mine.has(f.id) &&
+      !RECOMMENDED_FEEDS.some(
+        (cat) => f.url === cat.url || f.normalized_url === cat.url
+      )
+  );
+  const poolHtml =
+    poolTail.length === 0
+      ? ""
+      : `<div class="discover-pool-label">Shared pool</div>` +
+        poolTail
+          .map((f) => {
+            const name = escapeHtml(f.title || domainOf(f.url));
+            return `<button class="discover-feed" type="button"
+                    data-action="subscribe-discover" data-feed="${f.id}"
+                    title="Subscribe ${name} on this device">
+              <span class="discover-plus" aria-hidden="true">+</span>
+              <span class="discover-name">${name}</span>
+            </button>`;
+          })
+          .join("");
+
+  if (recommended === "" && poolHtml === "") {
     els.discover.hidden = true;
     els.discover.innerHTML = "";
     return;
   }
   els.discover.hidden = false;
-  els.discover.innerHTML =
-    `<div class="discover-label">Discover shared feeds</div>` +
-    suggestions
-      .map((f) => {
-        const name = escapeHtml(f.title || domainOf(f.url));
-        return `<button class="discover-feed" type="button" data-action="subscribe-discover"
-                data-feed="${f.id}" title="Subscribe ${name} on this device">
-          <span class="discover-plus" aria-hidden="true">+</span>
-          <span class="discover-name">${name}</span>
-        </button>`;
-      })
-      .join("");
+  els.discover.innerHTML = recommended + poolHtml;
 }
 
-/** Subscribe this device to a shared-pool feed from the Discover strip, then
- *  reload so the feed appears in the nav and drops out of Discover. */
+/** Subscribe this device to a shared-pool feed from the Shared-pool tail, then
+ *  reload so the feed appears in the nav and drops out of the tail. */
 async function subscribeDiscover(feedId: number): Promise<void> {
   const feed = poolFeeds.find((f) => f.id === feedId);
   const rawName = feed?.title || (feed ? domainOf(feed.url) : String(feedId));
@@ -364,6 +435,24 @@ async function subscribeDiscover(feedId: number): Promise<void> {
     await subscribeFeed(feedId);
     await loadAll();
     toast(`Added ${rawName} to this device`);
+  } catch (err) {
+    toast(err instanceof ApiError ? err.message : String(err), true);
+  }
+}
+
+/** Add a Recommended catalog feed on this device (find-or-create + subscribe),
+ *  then reload so it appears in the nav and its Discover row turns to "✓".
+ *  `already` covers the idempotent re-add (the url was already a subscription
+ *  on this device). */
+async function subscribeRecommended(catUrl: string, catName: string): Promise<void> {
+  try {
+    const res = await addFeed(catUrl, catName);
+    await loadAll();
+    toast(
+      res.already
+        ? `${catName} was already on this device`
+        : `Added ${catName} to this device`
+    );
   } catch (err) {
     toast(err instanceof ApiError ? err.message : String(err), true);
   }
@@ -387,7 +476,7 @@ async function loadAll(): Promise<void> {
   try {
     // Independent: one failing endpoint must not blank the others.
     await Promise.all([loadFeeds(), loadPool(), loadDiagnostics()]);
-    // Discover subtracts the device list from the pool — re-render now that
+    // Discover reads both the device list and the pool — re-render now that
     // both have settled (whichever resolved last).
     renderDiscover();
   } finally {
@@ -445,9 +534,18 @@ els.feedNav.addEventListener("click", (event) => {
 });
 
 // Discover strip lives outside #feedNav (its own container), so it gets its own
-// delegated listener. Subscribe is additive only — nothing auto-subscribes.
+// delegated listener. Both entry points are additive only — nothing
+// auto-subscribes: Recommended rows addFeed(url, name) (find-or-create +
+// subscribe), Shared-pool tail rows subscribeFeed(id). The "subscribe-*"
+// branches run before any row-click handling below (there is none here).
 els.discover.addEventListener("click", (event) => {
   const action = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
+  if (action?.dataset.action === "subscribe-recommended") {
+    if (action.dataset.url && action.dataset.name) {
+      void subscribeRecommended(action.dataset.url, action.dataset.name);
+    }
+    return;
+  }
   if (action?.dataset.action === "subscribe-discover") {
     void subscribeDiscover(Number(action.dataset.feed));
   }
